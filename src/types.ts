@@ -72,6 +72,8 @@ export interface ScrapeResult {
   error?: string;
   /** Screenshot en base64 (para debugging) */
   screenshot?: string;
+  /** Cookies de sesión serializadas cuando un scraper necesita exponerlas al integrador */
+  sessionCookies?: unknown;
   /** Log de debug con pasos del scraper */
   debug?: string;
 }
