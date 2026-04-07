@@ -1,5 +1,5 @@
 import type { Page, Frame } from "puppeteer-core";
-import type { BankMovement, BankScraper, CreditCardBalance, ScrapeResult, ScraperOptions } from "../types.js";
+import type { AccountBalance, BankMovement, BankScraper, CreditCardBalance, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE, type MovementSource } from "../types.js";
 import { closePopups, delay, formatRut, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
 import { runScraper } from "../infrastructure/scraper-runner.js";
@@ -185,20 +185,6 @@ async function extractMovementsFromFrame(frame: Frame, debugLog: string[]): Prom
 }
 
 // ─── extractTCMovements — versión corregida ──────────────────────────────────
-//
-// Correcciones vs versión original:
-//  A. Signo del monto → lee el atributo alt del <img> ("Cargo" / "Abono")
-//  B. Paginador       → frame.click("#btn-next") en lugar de btn.click()
-//                       dentro de evaluate(). Angular no reacciona al .click()
-//                       nativo de JS; frame.click() simula un evento real del mouse.
-//  C. Navegación      → espera cambio de tabla con huella primera+última fila
-//                       antes de leer la siguiente página (anti-doble-lectura).
-//  D. Extracción de filas → estructura real confirmada desde el HTML:
-//       td[0] fecha | td[1] descripción+cont-circle | td[2] tipo tarjeta
-//       td[3] div.container_monto > p + img          | td[4] flecha detalle
-//     El código original usaba cells[cells.length-1] → agarraba td[4] (flecha >).
-//     La descripción se limpia extrayendo solo p.customRow del td[1].
-
 async function extractTCMovements(
   frame: Frame,
   tab: string,
@@ -377,7 +363,7 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
   progress("Abriendo sitio del banco...");
   const loginResult = await bciLogin(page, rut, password, debugLog, doSave);
   if (!loginResult.success) {
-    return { success: false, bank, movements: [], error: loginResult.error, screenshot: loginResult.screenshot, debug: debugLog.join("\n") };
+    return { success: false, bank, accounts: [], error: loginResult.error, screenshot: loginResult.screenshot, debug: debugLog.join("\n") };
   }
 
   progress("Sesión iniciada correctamente");
@@ -465,7 +451,7 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
             return { nationalUsed: natUsed ? parseAmt(natUsed[1]) : 0, nationalAvailable: natAvail ? parseAmt(natAvail[1]) : 0, nationalTotal: natTotal ? parseAmt(natTotal[1]) : 0, internationalUsed: intUsed ? parseAmt(intUsed[1]) : 0, internationalAvailable: intAvail ? parseAmt(intAvail[1]) : 0, internationalTotal: intTotal ? parseAmt(intTotal[1]) : 0 };
           });
           for (const label of cardLabels) {
-            const card: CreditCardBalance = { label, national: { used: cupoData.nationalUsed, available: cupoData.nationalAvailable, total: cupoData.nationalTotal } };
+            const card: CreditCardBalance = { label, national: { used: cupoData.nationalUsed, available: cupoData.nationalAvailable, total: cupoData.nationalTotal }, movements: [] };
             if (cupoData.internationalTotal > 0) card.international = { used: cupoData.internationalUsed, available: cupoData.internationalAvailable, total: cupoData.internationalTotal, currency: "USD" };
             creditCards.push(card);
           }
@@ -480,7 +466,8 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
   await doSave(page, "06-final");
   const ss = doScreenshots ? (await page.screenshot({ encoding: "base64" })) as string : undefined;
 
-  return { success: true, bank, movements: deduplicated, balance, creditCards: creditCards.length > 0 ? creditCards : undefined, screenshot: ss, debug: debugLog.join("\n") };
+  const accounts: AccountBalance[] = [{ balance, movements: deduplicated }];
+  return { success: true, bank, accounts, creditCards: creditCards.length > 0 ? creditCards : undefined, screenshot: ss, debug: debugLog.join("\n") };
 }
 
 // ─── Export ──────────────────────────────────────────────────────

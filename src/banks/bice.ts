@@ -551,7 +551,7 @@ async function scrapeBice(session: BrowserSession, options: ScraperOptions): Pro
   progress("Abriendo sitio del banco...");
   const loginResult = await login(page, rut, password, debugLog, doSave);
   if (!loginResult.success) {
-    return { success: false, bank, movements: [], error: loginResult.error, screenshot: loginResult.screenshot, debug: debugLog.join("\n") };
+    return { success: false, bank, accounts: [], error: loginResult.error, screenshot: loginResult.screenshot, debug: debugLog.join("\n") };
   }
 
   progress("Sesión iniciada correctamente");
@@ -576,7 +576,7 @@ async function scrapeBice(session: BrowserSession, options: ScraperOptions): Pro
   const link = await activePage.$("a.ultimosMov");
   if (!link) {
     const ss = await activePage.screenshot({ encoding: "base64" });
-    return { success: false, bank, movements: [], balance, error: "No se pudo navegar a movimientos", screenshot: ss as string, debug: debugLog.join("\n") };
+    return { success: false, bank, accounts: [], error: "No se pudo navegar a movimientos", screenshot: ss as string, debug: debugLog.join("\n") };
   }
   await link.click();
   try { await activePage.waitForSelector("div.transaction-table__container", { timeout: 15000 }); } catch { /* timeout */ }
@@ -687,7 +687,7 @@ async function scrapeBice(session: BrowserSession, options: ScraperOptions): Pro
   await doSave(activePage, "07-final");
   const ss = doScreenshots ? (await activePage.screenshot({ encoding: "base64", fullPage: true })) as string : undefined;
 
-  return { success: true, bank, movements: finalMovements, balance: balance || undefined, creditCards: creditCards, screenshot: ss, debug: debugLog.join("\n") };
+  return { success: true, bank, accounts: [{ balance: balance || undefined, movements: finalMovements }], creditCards: creditCards, screenshot: ss, debug: debugLog.join("\n") };
 }
 
 // ─── Export ──────────────────────────────────────────────────────
