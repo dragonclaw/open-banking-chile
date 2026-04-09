@@ -1,10 +1,9 @@
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import type { BankMovement, BankScraper, CreditCardBalance, MovementSource, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { DebugLog, delay, deduplicateMovements, findChrome, normalizeDate, normalizeOwner, normalizeInstallments, parseChileanAmount, saveScreenshot as _saveScreenshot } from "../utils.js";
+import { DebugLog, delay, deduplicateAcrossSources, deduplicateMovements, findChrome, monthYearLabel, normalizeDate, normalizeOwner, normalizeInstallments, parseChileanAmount } from "../utils.js";
 
 // ─── Constants ───────────────────────────────────────────────────
 
@@ -451,11 +450,7 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
         dueDate: normalizeDate(billedInfo.dueDate),
         minimumPayment: billedInfo.minimumPayment,
       };
-      // Derive billing period label (e.g. "Marzo 2026")
-      const bd = normalizeDate(billedInfo.billingDate);
-      const [, mm, yyyy] = bd.split("-");
-      const monthNames = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
-      creditCard.billingPeriod = `${monthNames[parseInt(mm, 10) - 1]} ${yyyy}`;
+      creditCard.billingPeriod = monthYearLabel(creditCard.lastStatement.billingDate);
     }
 
     const billedMovements = await paginateCmrMovements(page, MOVEMENT_SOURCE.credit_card_billed, debugLog);
@@ -466,7 +461,7 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
   // Tag movements with card mask
   const cardMask = creditCard.label.match(/\*{4}\d{4}/)?.[0];
   const tagged = cardMask ? allMovements.map(m => ({ ...m, card: cardMask })) : allMovements;
-  creditCard.movements = deduplicateMovements(tagged);
+  creditCard.movements = deduplicateAcrossSources(deduplicateMovements(tagged));
 
   return { movements: creditCard.movements, creditCard };
 }
@@ -750,13 +745,30 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
           }
         }
 
-        // First row signature for change detection
+        // First row signature for change detection.
+        // For billed movements, prefer the "fecha de compra" table — "pendientes de
+        // confirmación" rows don't change across pages and cause false negatives.
         let firstRow = "";
-        for (const r of roots) {
-          const cells = (r as Element).querySelectorAll("table tbody tr:first-child td");
-          if (cells.length > 0) {
-            firstRow = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim()).join("|");
-            break;
+        if (isBilled) {
+          outer: for (const r of roots) {
+            for (const tbl of Array.from((r as Element).querySelectorAll<HTMLTableElement>("table"))) {
+              const hdr = (tbl.querySelector("thead, tr:first-child") as HTMLElement | null)?.innerText?.toLowerCase() ?? "";
+              if (!hdr.includes("fecha de compra")) continue;
+              const cells = tbl.querySelectorAll("tbody tr:first-child td");
+              if (cells.length > 0) {
+                firstRow = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim()).join("|");
+                break outer;
+              }
+            }
+          }
+        }
+        if (!firstRow) {
+          for (const r of roots) {
+            const cells = (r as Element).querySelectorAll("table tbody tr:first-child td");
+            if (cells.length > 0) {
+              firstRow = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim()).join("|");
+              break;
+            }
           }
         }
 
@@ -788,10 +800,11 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
 
     if (!result.clicked) break;
 
-    // Wait for content to change
+    // Wait for content to change — use the same "fecha de compra" preference as above
     const prevRow = result.firstRow;
+    const isBilled = source === MOVEMENT_SOURCE.credit_card_billed;
     const changed = await page.waitForFunction(
-      ({ host: h, prev }: { host: string; prev: string }) => {
+      ({ host: h, prev, billed }: { host: string; prev: string; billed: boolean }) => {
         const el = document.querySelector(h) as Element & { shadowRoot?: ShadowRoot };
         const topRoot = el?.shadowRoot || document;
         function collectAll(root: ShadowRoot | Element | Document): Array<ShadowRoot | Element> {
@@ -802,7 +815,23 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
           }
           return found;
         }
-        for (const root of collectAll(topRoot)) {
+        const roots = collectAll(topRoot);
+        // Prefer "fecha de compra" table for billed to avoid false negatives
+        if (billed) {
+          for (const r of roots) {
+            for (const tbl of Array.from((r as Element).querySelectorAll<HTMLTableElement>("table"))) {
+              const hdr = (tbl.querySelector("thead, tr:first-child") as HTMLElement | null)?.innerText?.toLowerCase() ?? "";
+              if (!hdr.includes("fecha de compra")) continue;
+              const cells = tbl.querySelectorAll("tbody tr:first-child td");
+              if (cells.length > 0) {
+                const sig = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim()).join("|");
+                return sig !== prev && sig !== "";
+              }
+            }
+          }
+        }
+        // Fallback: any table's first row
+        for (const root of roots) {
           const cells = (root as Element).querySelectorAll("table tbody tr:first-child td");
           if (cells.length > 0) {
             const sig = Array.from(cells).map(c => (c as HTMLElement).innerText?.trim()).join("|");
@@ -811,7 +840,7 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
         }
         return false;
       },
-      { host, prev: prevRow },
+      { host, prev: prevRow, billed: isBilled },
       { timeout: 15000 },
     ).then(() => true, () => false);
 
