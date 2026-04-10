@@ -22,13 +22,13 @@ export async function runScraper(
   browserOptions: Partial<BrowserOptions>,
   scrapeFn: ScrapeFn,
 ): Promise<ScrapeResult> {
-  const { rut, password, chromePath, saveScreenshots, headful } = options;
+  const { rut, password, chromePath, saveScreenshots, headful, onDebug } = options;
 
   if (!rut || !password) {
     return {
       success: false,
       bank: bankId,
-      movements: [],
+      accounts: [],
       error: "Debes proveer RUT y clave.",
     };
   }
@@ -37,7 +37,7 @@ export async function runScraper(
 
   try {
     session = await launchBrowser(
-      { chromePath, headful, ...browserOptions },
+      { chromePath, headful, onDebug, ...browserOptions },
       !!saveScreenshots,
     );
 
@@ -46,7 +46,7 @@ export async function runScraper(
     return {
       success: false,
       bank: bankId,
-      movements: [],
+      accounts: [],
       error: `Error del scraper: ${error instanceof Error ? error.message : String(error)}`,
       debug: session?.debugLog.join("\n"),
     };

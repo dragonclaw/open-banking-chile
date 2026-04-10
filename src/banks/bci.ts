@@ -1,15 +1,51 @@
 import type { Page, Frame } from "puppeteer-core";
-import type { BankMovement, BankScraper, CreditCardBalance, ScrapeResult, ScraperOptions } from "../types.js";
+import type { AccountBalance, BankMovement, BankScraper, CreditCardBalance, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE, type MovementSource } from "../types.js";
 import { closePopups, delay, formatRut, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { detect2FA, waitFor2FA } from "../actions/two-factor.js";
 import { detectLoginError } from "../actions/login.js";
+import { createInterceptor } from "../intercept.js";
 
 // ─── BCI-specific constants ──────────────────────────────────────
 
 const LOGIN_URL = "https://www.bci.cl/corporativo/banco-en-linea/personas";
+
+const BCI_CHECKING_API_PREFIX =
+  "https://apilocal.bci.cl/bci-produccion/api-bci/bff-saldosyultimosmovimientoswebpersonas";
+
+// ─── API response normalizers ────────────────────────────────────
+
+interface BciApiMovement {
+  fechaMovimiento: string;
+  monto: string;
+  tipo: string; // 'C' = cargo (debit), 'A' = abono (credit)
+  glosa: string;
+}
+
+export function normalizeBciApiMovements(captures: unknown[]): BankMovement[] {
+  const movements: BankMovement[] = [];
+  for (const capture of captures) {
+    const obj = capture as { movimientos?: BciApiMovement[] };
+    const list = obj?.movimientos;
+    if (!Array.isArray(list)) continue;
+    for (const m of list) {
+      const raw = Math.round(parseFloat(m.monto));
+      if (!raw || isNaN(raw)) continue;
+      const amount = m.tipo === "C" ? -raw : raw;
+      const dateStr = m.fechaMovimiento?.split("T")[0] ?? "";
+      movements.push({
+        date: normalizeDate(dateStr),
+        description: m.glosa ?? "",
+        amount,
+        balance: 0,
+        source: MOVEMENT_SOURCE.account,
+      });
+    }
+  }
+  return movements;
+}
 
 const IFRAME_PATTERNS = {
   content: ["miBanco.jsf", "vistaSupercartola"],
@@ -184,50 +220,171 @@ async function extractMovementsFromFrame(frame: Frame, debugLog: string[]): Prom
   return all;
 }
 
-async function extractTCMovements(frame: Frame, tab: string, billingType: string, source: MovementSource, debugLog: string[]): Promise<BankMovement[]> {
+// ─── extractTCMovements — versión corregida ──────────────────────────────────
+async function extractTCMovements(
+  frame: Frame,
+  tab: string,
+  billingType: string,
+  source: MovementSource,
+  debugLog: string[],
+): Promise<BankMovement[]> {
+
+  // ── FASE 1: Seleccionar pestaña (Nacional $ / Internacional USD) ────────────
   await frame.evaluate((tabName: string) => {
-    for (const span of document.querySelectorAll("bci-wk-tabs span, .listTab span, .listTab a span")) {
-      if (span.textContent?.trim() === tabName) { (span.closest("a") || span as HTMLElement).click(); return; }
+    for (const el of document.querySelectorAll(".listTab span, .bci-wk-tab span, .listTab a span")) {
+      if ((el as HTMLElement).textContent?.trim() === tabName) {
+        const anchor = el.closest("a") as HTMLElement | null;
+        if (anchor) { anchor.click(); return; }
+      }
     }
   }, tab);
-  await delay(2000);
+  await delay(2500);
 
+  // ── FASE 2: Seleccionar tipo de facturación ─────────────────────────────────
   await frame.evaluate((btnText: string) => {
-    for (const btn of document.querySelectorAll("button")) {
-      if (btn.textContent?.trim() === btnText) { btn.click(); return; }
+    for (const btn of document.querySelectorAll("button.btn_blue_border, button")) {
+      if ((btn as HTMLElement).textContent?.trim() === btnText) {
+        (btn as HTMLElement).click();
+        return;
+      }
     }
   }, billingType);
-  await delay(2000);
+  await delay(2500);
 
+  // ── Verificar si hay movimientos ────────────────────────────────────────────
   const hasNoMovements = await frame.evaluate(() => {
-    const text = document.body?.innerText?.toLowerCase() || "";
+    const text = (document.body?.innerText || "").toLowerCase();
     return text.includes("no tienes movimientos") || text.includes("sin movimientos");
   });
-  if (hasNoMovements) { debugLog.push(`    ${tab} / ${billingType}: sin movimientos`); return []; }
-
-  const raw = await frame.evaluate(() => {
-    const results: Array<{ date: string; description: string; amount: string }> = [];
-    for (const row of document.querySelectorAll("table tbody tr, .wrapper-table tr")) {
-      const cells = Array.from(row.querySelectorAll("td"));
-      if (cells.length < 2) continue;
-      const date = cells[0]?.textContent?.trim() || "";
-      if (!date || !/\d{1,2}[\/.\-\s]/.test(date)) continue;
-      const description = cells[1]?.textContent?.trim() || "";
-      const amount = cells[cells.length - 1]?.textContent?.trim() || cells[2]?.textContent?.trim() || "";
-      if (description && amount) results.push({ date, description, amount });
-    }
-    return results;
-  });
-
-  const movements: BankMovement[] = [];
-  for (const r of raw) {
-    const numStr = r.amount.replace(/[^0-9.\-,]/g, "");
-    const amount = parseFloat(numStr.replace(/\./g, "").replace(",", ".")) || 0;
-    if (amount === 0) continue;
-    movements.push({ date: normalizeDate(r.date), description: r.description, amount: -Math.abs(amount), balance: 0, source });
+  if (hasNoMovements) {
+    debugLog.push(`    ${tab} / ${billingType}: sin movimientos`);
+    return [];
   }
-  debugLog.push(`    ${tab} / ${billingType}: ${movements.length} movimientos`);
-  return movements;
+
+  // ── FASE 3: Paginación robusta ───────────────────────────────────────────────
+  const allMovements: BankMovement[] = [];
+
+  for (let pageIndex = 0; pageIndex < 50; pageIndex++) {
+
+    // Estructura real de la tabla (5 columnas):
+    //   td[0]  fecha
+    //   td[1]  descripción + opcional .cont-circle
+    //   td[2]  tipo de tarjeta  ← no se usa
+    //   td[3]  div.container_monto > p (monto) + img (alt="Cargo"|"Abono")
+    //   td[4]  flecha de detalle  ← ignorar
+    const rawRows = await frame.evaluate(() => {
+      const results: Array<{
+        date: string;
+        description: string;
+        rawAmount: string;
+        isCargo: boolean;
+        pendingConfirmation: boolean;
+      }> = [];
+
+      const rows = document.querySelectorAll("table.custom-table tbody tr, .wrapper-table table tbody tr");
+
+      for (const row of rows) {
+        const cells = row.querySelectorAll("td");
+        if (cells.length < 4) continue;
+
+        const date = cells[0]?.textContent?.trim() ?? "";
+        if (!date || !/\d/.test(date)) continue;
+
+        const descP = cells[1]?.querySelector("p.customRow, p:first-child") as HTMLElement | null;
+        const description = descP?.textContent?.trim() ?? cells[1]?.textContent?.trim() ?? "";
+
+        const pendingConfirmation = !!cells[1]?.querySelector(".cont-circle");
+
+        const montoCell = cells[3];
+        const montoP = montoCell?.querySelector(".container_monto p, p") as HTMLElement | null;
+        const rawAmount = montoP?.textContent?.trim() ?? "";
+
+        const img = montoCell?.querySelector("img") as HTMLImageElement | null;
+        const isCargo = (img?.getAttribute("alt") ?? "").toLowerCase() === "cargo";
+
+        if (!rawAmount) continue;
+
+        results.push({ date, description, rawAmount, isCargo, pendingConfirmation });
+      }
+      return results;
+    });
+
+    debugLog.push(`    ${tab}/${billingType} página ${pageIndex + 1}: ${rawRows.length} filas`);
+
+    for (const r of rawRows) {
+      const absAmount = parseChileanAmount(r.rawAmount);
+      if (absAmount === 0) continue;
+
+      allMovements.push({
+        date: normalizeDate(r.date),
+        description: r.description,
+        amount: r.isCargo ? -absAmount : absAmount,
+        balance: 0,
+        source,
+      });
+    }
+
+    // Verificar si hay página siguiente
+    const canAdvance = await frame.evaluate(() => {
+      const btn = document.getElementById("btn-next");
+      if (!btn) return false;
+      return (
+        !btn.classList.contains("disable") &&
+        btn.getAttribute("aria-disabled") !== "true" &&
+        !(btn as HTMLButtonElement).disabled
+      );
+    });
+
+    if (!canAdvance) break;
+
+    // frame.click() simula evento real del mouse; Angular ignora el .click()
+    // nativo de JS lanzado desde evaluate().
+    try {
+      await frame.click("#btn-next");
+    } catch {
+      break;
+    }
+
+    // Esperar que la tabla cambie antes de leer la siguiente página
+    const lastRow = rawRows[rawRows.length - 1];
+    const pageSignature =
+      (rawRows[0]?.date ?? "") +
+      (rawRows[0]?.rawAmount ?? "") +
+      (lastRow?.date ?? "") +
+      (lastRow?.rawAmount ?? "");
+
+    const changed = await waitForTableChange(frame, pageSignature, 8000);
+    if (!changed) break;
+  }
+
+  debugLog.push(`    ${tab} / ${billingType}: ${allMovements.length} movimientos totales`);
+  return allMovements;
+}
+
+async function waitForTableChange(
+  frame: Frame,
+  previousSignature: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const currentSignature = await frame.evaluate(() => {
+      const rows = document.querySelectorAll("table.custom-table tbody tr, .wrapper-table table tbody tr");
+      if (rows.length === 0) return "";
+      const first = rows[0].querySelectorAll("td");
+      const last  = rows[rows.length - 1].querySelectorAll("td");
+      return (
+        (first[0]?.textContent?.trim() ?? "") +
+        (first[3]?.querySelector("p")?.textContent?.trim() ?? "") +
+        (last[0]?.textContent?.trim() ?? "") +
+        (last[3]?.querySelector("p")?.textContent?.trim() ?? "")
+      );
+    });
+
+    if (currentSignature && currentSignature !== previousSignature) return true;
+    await delay(400);
+  }
+  return false;
 }
 
 // ─── Main scrape function ────────────────────────────────────────
@@ -239,10 +396,15 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
   const bank = "bci";
   const progress = onProgress || (() => {});
 
+  // Install API interceptor before first page.goto()
+  const interceptor = await createInterceptor(page, [
+    { id: "bci-checking", urlPrefix: BCI_CHECKING_API_PREFIX },
+  ]);
+
   progress("Abriendo sitio del banco...");
   const loginResult = await bciLogin(page, rut, password, debugLog, doSave);
   if (!loginResult.success) {
-    return { success: false, bank, movements: [], error: loginResult.error, screenshot: loginResult.screenshot, debug: debugLog.join("\n") };
+    return { success: false, bank, accounts: [], error: loginResult.error, screenshot: loginResult.screenshot, debug: debugLog.join("\n") };
   }
 
   progress("Sesión iniciada correctamente");
@@ -259,24 +421,16 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
     const movFrame = await waitForFrame(page, IFRAME_PATTERNS.movements, 15000);
     if (movFrame) {
       await delay(3000);
-      const accounts = await movFrame.evaluate((sel: string) => {
-        const select = document.querySelector(sel) as HTMLSelectElement | null;
-        if (!select) return [];
-        return Array.from(select.options).map((o) => ({ value: o.value, label: o.textContent?.trim() || "" }));
-      }, ACCOUNT_SELECT);
-      debugLog.push(`  Found ${accounts.length} account(s)`);
 
-      for (let i = 0; i < accounts.length; i++) {
-        if (i > 0) {
-          await movFrame.evaluate((value: string, sel: string) => {
-            const select = document.querySelector(sel) as HTMLSelectElement | null;
-            if (!select) return;
-            select.value = value;
-            select.dispatchEvent(new Event("change", { bubbles: true }));
-          }, accounts[i].value, ACCOUNT_SELECT);
-          await delay(3000);
-        }
-        if (balance === undefined) {
+      // Try API interception first
+      const captured = await interceptor.waitFor("bci-checking", 10_000);
+      if (captured.length > 0) {
+        debugLog.push(`  Checking API: ${captured.length} response(s) captured`);
+        const apiMovements = normalizeBciApiMovements(captured);
+        debugLog.push(`  Checking API movements: ${apiMovements.length}`);
+        if (apiMovements.length > 0) {
+          allMovements.push(...apiMovements);
+          // Still extract balance from the iframe DOM
           balance = await movFrame.evaluate(() => {
             const el = document.querySelector("#saldoDis + div, .bci-h2-w800");
             if (!el) return undefined;
@@ -285,9 +439,40 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
             return undefined;
           });
         }
-        const movements = await extractMovementsFromFrame(movFrame, debugLog);
-        const prefixed = accounts.length > 1 ? movements.map(m => ({ ...m, description: `[${accounts[i].label}] ${m.description}`.trim() })) : movements;
-        allMovements.push(...prefixed);
+      }
+
+      if (allMovements.length === 0) {
+        debugLog.push("  Checking API: no data, falling back to HTML extraction");
+        const accounts = await movFrame.evaluate((sel: string) => {
+          const select = document.querySelector(sel) as HTMLSelectElement | null;
+          if (!select) return [];
+          return Array.from(select.options).map((o) => ({ value: o.value, label: o.textContent?.trim() || "" }));
+        }, ACCOUNT_SELECT);
+        debugLog.push(`  Found ${accounts.length} account(s)`);
+
+        for (let i = 0; i < accounts.length; i++) {
+          if (i > 0) {
+            await movFrame.evaluate((value: string, sel: string) => {
+              const select = document.querySelector(sel) as HTMLSelectElement | null;
+              if (!select) return;
+              select.value = value;
+              select.dispatchEvent(new Event("change", { bubbles: true }));
+            }, accounts[i].value, ACCOUNT_SELECT);
+            await delay(3000);
+          }
+          if (balance === undefined) {
+            balance = await movFrame.evaluate(() => {
+              const el = document.querySelector("#saldoDis + div, .bci-h2-w800");
+              if (!el) return undefined;
+              const match = (el as HTMLElement).textContent?.trim().match(/\$\s*([\d.]+)/);
+              if (match) return parseInt(match[1].replace(/\./g, ""), 10);
+              return undefined;
+            });
+          }
+          const movements = await extractMovementsFromFrame(movFrame, debugLog);
+          const prefixed = accounts.length > 1 ? movements.map(m => ({ ...m, description: `[${accounts[i].label}] ${m.description}`.trim() })) : movements;
+          allMovements.push(...prefixed);
+        }
       }
     }
   }
@@ -330,7 +515,7 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
             return { nationalUsed: natUsed ? parseAmt(natUsed[1]) : 0, nationalAvailable: natAvail ? parseAmt(natAvail[1]) : 0, nationalTotal: natTotal ? parseAmt(natTotal[1]) : 0, internationalUsed: intUsed ? parseAmt(intUsed[1]) : 0, internationalAvailable: intAvail ? parseAmt(intAvail[1]) : 0, internationalTotal: intTotal ? parseAmt(intTotal[1]) : 0 };
           });
           for (const label of cardLabels) {
-            const card: CreditCardBalance = { label, national: { used: cupoData.nationalUsed, available: cupoData.nationalAvailable, total: cupoData.nationalTotal } };
+            const card: CreditCardBalance = { label, national: { used: cupoData.nationalUsed, available: cupoData.nationalAvailable, total: cupoData.nationalTotal }, movements: [] };
             if (cupoData.internationalTotal > 0) card.international = { used: cupoData.internationalUsed, available: cupoData.internationalAvailable, total: cupoData.internationalTotal, currency: "USD" };
             creditCards.push(card);
           }
@@ -345,7 +530,8 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
   await doSave(page, "06-final");
   const ss = doScreenshots ? (await page.screenshot({ encoding: "base64" })) as string : undefined;
 
-  return { success: true, bank, movements: deduplicated, balance, creditCards: creditCards.length > 0 ? creditCards : undefined, screenshot: ss, debug: debugLog.join("\n") };
+  const accounts: AccountBalance[] = [{ balance, movements: deduplicated }];
+  return { success: true, bank, accounts, creditCards: creditCards.length > 0 ? creditCards : undefined, screenshot: ss, debug: debugLog.join("\n") };
 }
 
 // ─── Export ──────────────────────────────────────────────────────
