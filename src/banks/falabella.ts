@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type Locator, type Page } from "playwright-core";
 import type { BankMovement, BankScraper, CreditCardBalance, MovementSource, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
 import { DebugLog, delay, deduplicateAcrossSources, deduplicateMovements, findChrome, monthYearLabel, normalizeDate, normalizeOwner, normalizeInstallments, parseChileanAmount } from "../utils.js";
@@ -385,17 +385,12 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
   const cupoData = await extractCupos(page, debugLog);
   if (cupoData) Object.assign(creditCard, cupoData);
 
-  // Click on CMR product card
-  const cmrLink = page.getByRole("link", { name: /CMR/ }).first()
-    .or(page.locator("#cardDetail0, [id^='cardDetail']").first())
-    .or(page.locator("a, button, div").filter({ hasText: /CMR/i }).first());
-
-  if (!(await cmrLink.isVisible({ timeout: 5000 }).catch(() => false))) {
+  const cardClicked = await clickCmrProductCard(page, debugLog);
+  if (!cardClicked) {
     debugLog.push("  [CMR] No CMR card found on dashboard");
     return { movements: [], creditCard };
   }
 
-  await cmrLink.click();
   await page.waitForLoadState("networkidle").catch(() => {});
   await delay(5000);
   await screenshotIfEnabled(page, "06-cmr-card", doScreenshots, debugLog);
@@ -468,21 +463,111 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
 
 // ─── CMR Shadow DOM helpers ─────────────────────────────────────
 
+async function clickCmrProductCard(page: Page, debugLog: string[]): Promise<boolean> {
+  await waitForLocatorAttached(
+    page.locator("app-credit-cards, #cardDetail0, a[id^='cardDetail']").first(),
+    5000,
+  );
+
+  const candidates: Array<{ label: string; locator: Locator }> = [
+    { label: "#cardDetail0", locator: page.locator("#cardDetail0").first() },
+    {
+      label: "a[id^='cardDetail']",
+      locator: page
+        .locator("a[id^='cardDetail']")
+        .filter({ hasText: /CMR|Mastercard|Visa/i })
+        .first(),
+    },
+    {
+      label: "app-credit-cards a.div-product",
+      locator: page
+        .locator("app-credit-cards a.div-product")
+        .filter({ hasText: /CMR|Mastercard|Visa/i })
+        .first(),
+    },
+    {
+      label: "role link",
+      locator: page.getByRole("link", { name: /CMR|Mastercard|Visa/i }).first(),
+    },
+    {
+      label: "text link/button",
+      locator: page.locator("a, button").filter({ hasText: /CMR|Mastercard|Visa/i }).first(),
+    },
+  ];
+
+  for (const candidate of candidates) {
+    if (!(await isLocatorVisible(candidate.locator, 1500))) continue;
+    try {
+      await candidate.locator.scrollIntoViewIfNeeded();
+    } catch { /* best effort */ }
+    await candidate.locator.click({ timeout: 5000 });
+    debugLog.push(`  [CMR] Clicked card via ${candidate.label}`);
+    return true;
+  }
+
+  const clicked = await page.evaluate(() => {
+    function clickElement(element: HTMLElement): void {
+      element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      element.click();
+      element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    }
+
+    const cardDetail = document.querySelector<HTMLElement>("#cardDetail0");
+    if (cardDetail) {
+      clickElement(cardDetail);
+      return "#cardDetail0";
+    }
+
+    const links = document.querySelectorAll<HTMLElement>(
+      "app-credit-cards a, a[id^='cardDetail']",
+    );
+    for (const element of Array.from(links)) {
+      const text = element.innerText || element.textContent || "";
+      if (!/CMR|Mastercard|Visa/i.test(text)) continue;
+      clickElement(element);
+      return element.id ? `#${element.id}` : "app-credit-cards link";
+    }
+
+    return null;
+  });
+
+  if (clicked) {
+    debugLog.push(`  [CMR] Clicked card via DOM fallback ${clicked}`);
+    return true;
+  }
+
+  return false;
+}
+
+async function waitForLocatorAttached(locator: Locator, timeoutMs: number): Promise<void> {
+  try {
+    await locator.waitFor({ state: "attached", timeout: timeoutMs });
+  } catch { /* optional wait */ }
+}
+
+async function isLocatorVisible(locator: Locator, timeoutMs: number): Promise<boolean> {
+  try {
+    return await locator.isVisible({ timeout: timeoutMs });
+  } catch {
+    return false;
+  }
+}
+
 async function waitForCmrContent(page: Page, timeoutMs: number): Promise<void> {
   try {
     await page.waitForFunction((host: string) => {
       const el = document.querySelector(host) as Element & { shadowRoot?: ShadowRoot };
-      if (!el?.shadowRoot) return false;
-      function collectAll(root: ShadowRoot | Element): Array<ShadowRoot | Element> {
-        const found: Array<ShadowRoot | Element> = [root];
-        for (const child of Array.from((root as Element).querySelectorAll("*"))) {
+      const topRoot = el?.shadowRoot || document;
+      function collectAll(root: ShadowRoot | Element | Document): Array<ShadowRoot | Element | Document> {
+        const found: Array<ShadowRoot | Element | Document> = [root];
+        for (const child of Array.from((root as ParentNode).querySelectorAll("*"))) {
           const sr = (child as Element & { shadowRoot?: ShadowRoot }).shadowRoot;
           if (sr) found.push(...collectAll(sr));
         }
         return found;
       }
-      return collectAll(el.shadowRoot).some(
-        r => (r as Element).querySelectorAll("table tbody tr td").length > 0,
+      return collectAll(topRoot).some(
+        r => (r as ParentNode).querySelectorAll("table tbody tr td").length > 0,
       );
     }, "credit-card-movements", { timeout: timeoutMs });
   } catch { /* timeout */ }
@@ -628,9 +713,15 @@ async function clickCmrTab(page: Page, debugLog: string[]): Promise<boolean> {
     if (shadowEl?.shadowRoot) roots.push(shadowEl.shadowRoot);
     roots.push(document);
 
+    function clickElement(element: HTMLElement): void {
+      element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      element.click();
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+
     // Try well-known radio id first
     for (const root of roots) {
-      const radio = root.querySelector(`#${radioId}`) as HTMLInputElement | null;
+      const radio = root.getElementById?.(radioId) as HTMLInputElement | null;
       if (radio) {
         radio.checked = true;
         radio.dispatchEvent(new Event("change", { bubbles: true }));
@@ -639,6 +730,15 @@ async function clickCmrTab(page: Page, debugLog: string[]): Promise<boolean> {
           ?? (radio.closest("label") as HTMLElement | null);
         if (label) label.click();
         return `radio#${radio.id}`;
+      }
+    }
+
+    // The legacy Angular CMR page uses tabs like <a id="InvoicedMovements">.
+    for (const root of roots) {
+      const tab = root.getElementById?.("InvoicedMovements") as HTMLElement | null;
+      if (tab) {
+        clickElement(tab);
+        return `tab#${tab.id}`;
       }
     }
 
@@ -657,6 +757,16 @@ async function clickCmrTab(page: Page, debugLog: string[]): Promise<boolean> {
         }
         label.click();
         return `label: "${label.innerText.trim()}"`;
+      }
+    }
+
+    // Fallback for tab/link/button UIs without radios or labels.
+    for (const root of roots) {
+      for (const tab of Array.from(root.querySelectorAll<HTMLElement>("a, button, [role='tab']"))) {
+        const text = tab.innerText?.trim().toLowerCase() || "";
+        if (!text.includes("facturado")) continue;
+        clickElement(tab);
+        return `tab: "${tab.innerText.trim()}"`;
       }
     }
     return null;

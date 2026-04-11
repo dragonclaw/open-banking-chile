@@ -1,11 +1,16 @@
-import type { Page } from "puppeteer-core";
+import type { Frame, Page } from "puppeteer-core";
 import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
-import { MOVEMENT_SOURCE } from "../types.js";
-import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovements } from "../utils.js";
+import { closePopups, delay, deduplicateMovements } from "../utils.js";
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { fillRut, fillPassword, clickSubmit, detectLoginError } from "../actions/login.js";
 import { dismissBanners } from "../actions/navigation.js";
+import {
+  isScotiabankFullAccountPage,
+  parseScotiabankAccountMovements,
+  readScotiabankAccountPageState,
+  type ScotiabankAccountPageState,
+} from "./scotiabank-account-parser.js";
 
 // ─── Scotiabank-specific constants ───────────────────────────────
 
@@ -36,8 +41,8 @@ async function waitForDashboardContent(page: Page): Promise<void> {
   while (Date.now() - start < 15000) {
     const hasContent = await page.evaluate(new Function(`${allDeepJs()}
       return allDeep(document, "a, button, span").some(el => {
-        const text = el.innerText?.trim().toLowerCase() || "";
-        return text === "ver cartola" || text === "cuenta corriente";
+        const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+        return text === "ver saldos y últimos movimientos" || text === "ver saldos y ultimos movimientos" || text === "cuenta corriente";
       });`) as () => boolean);
     if (hasContent) break;
     await delay(1500);
@@ -60,136 +65,242 @@ async function dismissScotiaTutorial(page: Page, debugLog: string[]): Promise<vo
   }
 }
 
-async function navigateToMovements(page: Page, debugLog: string[]): Promise<void> {
-  await waitForDashboardContent(page);
+type BrowserContext = Page | Frame;
 
-  // Try "Ver cartola" (pierce Shadow DOM)
-  const clickedCartola = await page.evaluate(new Function(`${allDeepJs()}
-    for (const el of allDeep(document, "a, button, span")) {
-      const text = el.innerText?.trim().toLowerCase() || "";
-      if (text === "ver cartola" || text === "ver saldo y movimientos") {
-        el.click(); return true;
-      }
+async function clickDeepText(
+  ctx: BrowserContext,
+  selectors: string,
+  options: { exact?: string[]; includes?: string[] },
+): Promise<string | null> {
+  return await ctx
+    .evaluate(
+      ({ selectors: selectorsArg, exact, includes }) => {
+        const normalizeText = (value: string): string =>
+          value
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        const getNodeText = (node: Element): string => {
+          const maybeInnerText = "innerText" in node ? String(node.innerText ?? "") : "";
+          return (maybeInnerText || node.textContent || "").replace(/\s+/g, " ").trim();
+        };
+
+        const allDeep = (root: Document | ShadowRoot, selector: string): Element[] => {
+          const matches = Array.from(root.querySelectorAll(selector));
+          for (const element of Array.from(root.querySelectorAll("*"))) {
+            const shadowRoot = (element as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+            if (shadowRoot) {
+              matches.push(...allDeep(shadowRoot, selector));
+            }
+          }
+          return matches;
+        };
+
+        const exactTexts = exact.map((value) => normalizeText(value));
+        const containsTexts = includes.map((value) => normalizeText(value));
+        const clickSelector = "a, button, [role='tab'], [role='button'], [data-testid]";
+
+        const getCandidateTexts = (node: Element): string[] => {
+          const values = [
+            getNodeText(node),
+            node.getAttribute("title") || "",
+            node.getAttribute("aria-label") || "",
+          ]
+            .map((value) => normalizeText(value))
+            .filter(Boolean);
+
+          return Array.from(new Set(values));
+        };
+
+        type Candidate = {
+          clickable: Element;
+          label: string;
+          matchedText: string;
+          isExact: boolean;
+        };
+
+        const candidates: Candidate[] = [];
+
+        for (const node of allDeep(document, selectorsArg)) {
+          const style = window.getComputedStyle(node as HTMLElement);
+          if (style.display === "none" || style.visibility === "hidden") continue;
+
+          const texts = getCandidateTexts(node);
+          if (texts.length === 0) continue;
+
+          const exactMatch = texts.find((text) => exactTexts.includes(text));
+          const includesMatch = exactMatch
+            ? null
+            : texts.find((text) =>
+                containsTexts.some(
+                  (target) =>
+                    text.includes(target) &&
+                    text.length <= Math.max(target.length * 2, target.length + 24),
+                ),
+              );
+
+          if (!exactMatch && !includesMatch) continue;
+
+          const clickable = node.matches(clickSelector) ? node : node.closest(clickSelector) || node;
+          const clickableStyle = window.getComputedStyle(clickable as HTMLElement);
+          if (clickableStyle.display === "none" || clickableStyle.visibility === "hidden") continue;
+
+          candidates.push({
+            clickable,
+            label: getNodeText(node) || getNodeText(clickable),
+            matchedText: exactMatch || includesMatch || "",
+            isExact: Boolean(exactMatch),
+          });
+        }
+
+        candidates.sort((left, right) => {
+          if (left.isExact !== right.isExact) return left.isExact ? -1 : 1;
+          if (left.matchedText.length !== right.matchedText.length) {
+            return left.matchedText.length - right.matchedText.length;
+          }
+          return left.label.length - right.label.length;
+        });
+
+        const selected = candidates[0];
+        if (selected) {
+          (selected.clickable as HTMLElement).click();
+          return selected.label;
+        }
+
+        return null;
+      },
+      {
+        selectors,
+        exact: options.exact ?? [],
+        includes: options.includes ?? [],
+      },
+    )
+    .catch(() => null);
+}
+
+function getContexts(page: Page): BrowserContext[] {
+  return [page, ...page.frames().filter((frame) => frame !== page.mainFrame())];
+}
+
+async function readAccountPageState(
+  ctx: BrowserContext,
+): Promise<ScotiabankAccountPageState | null> {
+  return await ctx.evaluate(readScotiabankAccountPageState).catch(() => null);
+}
+
+async function findFullAccountContext(page: Page): Promise<{
+  ctx: BrowserContext;
+  state: ScotiabankAccountPageState;
+  url: string;
+} | null> {
+  for (const ctx of getContexts(page)) {
+    const state = await readAccountPageState(ctx);
+    if (!state || !isScotiabankFullAccountPage(state)) continue;
+
+    return {
+      ctx,
+      state,
+      url: "url" in ctx ? ctx.url() : "",
+    };
+  }
+
+  return null;
+}
+
+async function waitForFullAccountPage(
+  page: Page,
+  debugLog: string[],
+  timeoutMs = 20000,
+): Promise<{
+  ctx: BrowserContext;
+  state: ScotiabankAccountPageState;
+  url: string;
+}> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const found = await findFullAccountContext(page);
+    if (found) {
+      debugLog.push(
+        `  Cuenta Corriente lista: ${found.state.rawMovements.length} filas (${found.url || "main"})`,
+      );
+      return found;
     }
-    return false;`) as () => boolean);
-  if (clickedCartola) { debugLog.push("  Clicked: Ver cartola"); await delay(5000); return; }
 
-  // Sidebar fallback
-  const clickedCuentas = await page.evaluate(new Function(`${allDeepJs()}
-    for (const el of allDeep(document, "a, button, li, span")) {
-      if (el.innerText?.trim().toLowerCase() === "cuentas") { el.click(); return true; }
+    await delay(1000);
+  }
+
+  throw new Error("No se pudo abrir la página completa de Cuenta Corriente");
+}
+
+async function activateSaldosTab(page: Page, debugLog: string[]): Promise<void> {
+  for (const ctx of getContexts(page)) {
+    const clicked = await clickDeepText(ctx, "a, button, [role='tab'], li, span", {
+      exact: ["Saldos y últimos movimientos"],
+    });
+    if (clicked) {
+      debugLog.push(`  Tab: ${clicked}`);
+      await delay(2000);
+      return;
     }
-    return false;`) as () => boolean);
-  if (clickedCuentas) { debugLog.push("  Sidebar: Cuentas"); await delay(2500); }
-
-  // Try clicking "Saldos y últimos movimientos" tab first (NOT "Cartolas" which shows PDFs)
-  const clickedSaldos = await page.evaluate(new Function(`${allDeepJs()}
-    for (const el of allDeep(document, "a, button, [role='tab'], li, span")) {
-      const text = el.innerText?.trim().toLowerCase() || "";
-      if (text.includes("saldos y") || text.includes("últimos movimientos") || text === "saldos") {
-        el.click(); return true;
-      }
-    }
-    return false;`) as () => boolean);
-  if (clickedSaldos) { debugLog.push("  Clicked: Saldos y últimos movimientos tab"); await delay(5000); return; }
-
-  const subTargets = ["movimientos", "estado de cuenta", "ver movimientos"];
-  for (const target of subTargets) {
-    const clicked = await page.evaluate(new Function(`${allDeepJs()}
-      var target = ${JSON.stringify(target)};
-      for (const el of allDeep(document, "a, button, [role='menuitem'], li, span")) {
-        const text = el.innerText?.trim().toLowerCase() || "";
-        if (text.includes(target) && text.length < 60) { el.click(); return true; }
-      }
-      return false;`) as () => boolean);
-    if (clicked) { debugLog.push(`  Clicked: ${target}`); await delay(5000); return; }
   }
 }
 
-async function extractMovements(page: Page): Promise<BankMovement[]> {
-  // Extract from page + all frames (piercing Shadow DOM)
-  const contexts: Array<{ evaluate: Page["evaluate"] }> = [page];
-  for (const frame of page.frames()) {
-    if (frame !== page.mainFrame()) contexts.push(frame as unknown as { evaluate: Page["evaluate"] });
-  }
+async function navigateToMovements(page: Page, debugLog: string[]): Promise<void> {
+  if (await findFullAccountContext(page)) return;
 
-  const allRaw: Array<{ date: string; description: string; amount: string; balance: string }> = [];
-  for (const ctx of contexts) {
-    try {
-      const raw = await ctx.evaluate(new Function(`${allDeepJs()}
-        const results = [];
-        const tables = allDeep(document, "table");
-        for (const table of tables) {
-          const rows = Array.from(table.querySelectorAll("tr"));
-          if (rows.length < 2) continue;
-          let dateIndex = 0, descriptionIndex = 1, cargoIndex = -1, abonoIndex = -1, amountIndex = -1, balanceIndex = -1, hasHeader = false;
-          for (const row of rows) {
-            const headers = row.querySelectorAll("th");
-            if (headers.length < 2) continue;
-            const ht = Array.from(headers).map(h => h.innerText?.trim().toLowerCase() || "");
-            if (!ht.some(h => h.includes("fecha"))) continue;
-            hasHeader = true;
-            dateIndex = ht.findIndex(h => h.includes("fecha"));
-            descriptionIndex = ht.findIndex(h => h.includes("descrip") || h.includes("detalle") || h.includes("glosa"));
-            cargoIndex = ht.findIndex(h => h.includes("cargo") || h.includes("débito") || h.includes("debito"));
-            abonoIndex = ht.findIndex(h => h.includes("abono") || h.includes("crédito") || h.includes("credito"));
-            amountIndex = ht.findIndex(h => h === "monto" || h.includes("importe"));
-            balanceIndex = ht.findIndex(h => h.includes("saldo"));
-            break;
-          }
-          if (!hasHeader) continue;
-          let lastDate = "";
-          for (const row of rows) {
-            const cells = row.querySelectorAll("td");
-            if (cells.length < 3) continue;
-            const values = Array.from(cells).map(c => c.innerText?.trim() || "");
-            const rawDate = values[dateIndex] || "";
-            const hasDate = /^\\d{1,2}[\\/.-]\\d{1,2}([\\/.-]\\d{2,4})?$/.test(rawDate);
-            const date = hasDate ? rawDate : lastDate;
-            if (!date) continue;
-            if (hasDate) lastDate = rawDate;
-            const description = descriptionIndex >= 0 ? (values[descriptionIndex] || "") : "";
-            let amount = "";
-            if (cargoIndex >= 0 && values[cargoIndex]) amount = "-" + values[cargoIndex];
-            else if (abonoIndex >= 0 && values[abonoIndex]) amount = values[abonoIndex];
-            else if (amountIndex >= 0) amount = values[amountIndex] || "";
-            const balance = balanceIndex >= 0 ? (values[balanceIndex] || "") : "";
-            if (!amount) continue;
-            results.push({ date, description, amount, balance });
-          }
-        }
-        if (results.length === 0) {
-          const cards = allDeep(document, "[class*='mov'], [class*='tran'], [class*='transaction'], li, article");
-          for (const card of cards) {
-            const text = card.innerText || "";
-            const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
-            if (lines.length < 3 || lines.length > 10) continue;
-            const date = lines.find(l => /\\d{1,2}[\\/.-]\\d{1,2}[\\/.-]\\d{2,4}/.test(l));
-            const amount = lines.find(l => /[$]\\s*[\\d.]+/.test(l));
-            if (!date || !amount) continue;
-            const description = lines.find(l => l !== date && l !== amount && l.length > 3) || "";
-            const balance = lines.find(l => l.toLowerCase().includes("saldo") && /[$]\\s*[\\d.]+/.test(l)) || "";
-            const isCargo = text.toLowerCase().includes("cargo") || text.toLowerCase().includes("débito") || amount.includes("-");
-            results.push({ date, description, amount: isCargo ? (amount.startsWith("-") ? amount : "-" + amount) : amount, balance });
-          }
-        }
-        return results;`) as () => Array<{ date: string; description: string; amount: string; balance: string }>);
-      allRaw.push(...raw);
-    } catch { /* detached frame */ }
-  }
+  await waitForDashboardContent(page);
 
-  const seen = new Set<string>();
-  return allRaw.map(m => {
-    const amount = parseChileanAmount(m.amount);
-    if (amount === 0) return null;
-    return { date: normalizeDate(m.date), description: m.description, amount, balance: m.balance ? parseChileanAmount(m.balance) : 0, source: MOVEMENT_SOURCE.account } as BankMovement;
-  }).filter((m): m is BankMovement => {
-    if (!m) return false;
-    const key = `${m.date}|${m.description}|${m.amount}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+  const clickedCuentas = await clickDeepText(page, "a, button, li, span", {
+    exact: ["Cuentas"],
   });
+  if (clickedCuentas) {
+    debugLog.push(`  Sidebar: ${clickedCuentas}`);
+    await delay(2000);
+  }
+
+  const clickedCuentaCorriente = await clickDeepText(page, "a, button, li, span", {
+    exact: ["Cuenta Corriente"],
+  });
+  if (clickedCuentaCorriente) {
+    debugLog.push(`  Sidebar: ${clickedCuentaCorriente}`);
+    await delay(2000);
+  }
+
+  const clickedSaldos = await clickDeepText(page, "a, button, li, span", {
+    exact: ["Ver saldos y últimos movimientos", "Ver saldo y movimientos"],
+  });
+  if (clickedSaldos) {
+    debugLog.push(`  Clicked: ${clickedSaldos}`);
+    await delay(5000);
+    await activateSaldosTab(page, debugLog);
+    await waitForFullAccountPage(page, debugLog);
+    return;
+  }
+
+  const clickedCartolas = await clickDeepText(page, "a, button, li, span", {
+    exact: ["Ver cartolas", "Ver cartola"],
+  });
+  if (clickedCartolas) {
+    debugLog.push(`  Fallback clicked: ${clickedCartolas}`);
+    await delay(5000);
+    await activateSaldosTab(page, debugLog);
+    await waitForFullAccountPage(page, debugLog);
+    return;
+  }
+
+  throw new Error("No se encontró el acceso a 'Ver saldos y últimos movimientos'");
+}
+
+async function extractMovements(page: Page): Promise<BankMovement[]> {
+  const found = await findFullAccountContext(page);
+  if (!found) {
+    return [];
+  }
+
+  return parseScotiabankAccountMovements(found.state.rawMovements);
 }
 
 async function scotiaPaginate(page: Page, debugLog: string[]): Promise<BankMovement[]> {
@@ -398,22 +509,11 @@ async function scrapeScotiabank(session: BrowserSession, options: ScraperOptions
   // Wait for movements table to load (spinner to disappear)
   debugLog.push("7b. Waiting for movements to load...");
   progress("Esperando carga de movimientos...");
-  const startWait = Date.now();
-  while (Date.now() - startWait < 20000) {
-    const hasTable = await page.evaluate(new Function(`${allDeepJs()}
-      // Check if a table with rows OR movement cards exist
-      const tables = allDeep(document, "table");
-      for (const t of tables) { if (t.querySelectorAll("tr").length > 1) return "table"; }
-      // Check for card-style movements
-      const cards = allDeep(document, "[class*='mov'], [class*='tran'], [class*='transaction']");
-      if (cards.length > 0) return "cards";
-      // Check if spinner is gone and there's text with amounts
-      const body = document.body?.innerText || "";
-      if (/\\$\\s*[\\d.]+/.test(body) && body.length > 500) return "text";
-      return null;`) as () => string | null);
-    if (hasTable) { debugLog.push(`  Content loaded: ${hasTable}`); break; }
-    await delay(2000);
-  }
+  const accountPage = await waitForFullAccountPage(page, debugLog);
+  debugLog.push(
+    `  Account page validated (${accountPage.url || "main"}): ${accountPage.state.fullTableHeaders.join(" | ")}`,
+  );
+  await activateSaldosTab(page, debugLog);
 
   await doSave(page, "04-movements-page");
 
@@ -444,6 +544,9 @@ async function scrapeScotiabank(session: BrowserSession, options: ScraperOptions
 
   // 9. Extract current period
   const movements = await scotiaPaginate(page, debugLog);
+  if (movements.length === 0) {
+    throw new Error("La página de Cuenta Corriente cargó, pero no se pudieron extraer movimientos");
+  }
   debugLog.push(`9. Extracted ${movements.length} movements (current period)`);
   progress(`Periodo actual: ${movements.length} movimientos`);
 
@@ -678,7 +781,11 @@ async function scrapeScotiabank(session: BrowserSession, options: ScraperOptions
   if (balance === undefined) {
     balance = await page.evaluate(() => {
       const bodyText = document.body?.innerText || "";
-      const patterns = [/saldo disponible[\s\S]{0,50}\$\s*([\d.]+)/i, /saldo actual[\s\S]{0,50}\$\s*([\d.]+)/i];
+      const patterns = [
+        /total disponible[\s\S]{0,50}\$\s*([\d.]+)/i,
+        /saldo disponible[\s\S]{0,50}\$\s*([\d.]+)/i,
+        /saldo actual[\s\S]{0,50}\$\s*([\d.]+)/i,
+      ];
       for (const pattern of patterns) { const match = bodyText.match(pattern); if (match) return parseInt(match[1].replace(/[^0-9]/g, ""), 10); }
       return undefined;
     });
