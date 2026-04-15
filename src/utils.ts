@@ -4,6 +4,23 @@ import type { Page } from "puppeteer-core";
 import type { BankMovement, CardOwner } from "./types.js";
 import { CARD_OWNER } from "./types.js";
 
+const WINDOWS_CHROME_EXECUTABLE = path.join(
+  "Google",
+  "Chrome",
+  "Application",
+  "chrome.exe"
+);
+const WINDOWS_CHROME_ENV_KEYS = [
+  "PROGRAMFILES",
+  "ProgramFiles",
+  "PROGRAMW6432",
+  "ProgramW6432",
+  "PROGRAMFILES(X86)",
+  "ProgramFiles(x86)",
+  "LOCALAPPDATA",
+  "LocalAppData",
+] as const;
+
 /**
  * Array de strings que llama a un callback en cada push.
  * Úsalo en lugar de `string[]` para transmitir logs en tiempo real.
@@ -54,6 +71,7 @@ export function findChrome(customPath?: string): string | null {
     // macOS
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ...buildWindowsChromeCandidates(),
     // Windows (WSL)
     "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
     "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe",
@@ -63,6 +81,32 @@ export function findChrome(customPath?: string): string | null {
     if (fs.existsSync(p)) return p;
   }
   return null;
+}
+
+function buildWindowsChromeCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const roots = WINDOWS_CHROME_ENV_KEYS.map((key) => env[key]);
+
+  return uniqueNonEmptyStrings(roots).map((root) =>
+    path.join(root, WINDOWS_CHROME_EXECUTABLE)
+  );
+}
+
+function uniqueNonEmptyStrings(values: Array<string | undefined>): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+
+  for (const value of values) {
+    const normalizedValue = value?.trim();
+
+    if (!normalizedValue || seen.has(normalizedValue)) {
+      continue;
+    }
+
+    seen.add(normalizedValue);
+    result.push(normalizedValue);
+  }
+
+  return result;
 }
 
 /** Guarda un screenshot si saveScreenshots está habilitado */

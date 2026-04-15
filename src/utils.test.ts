@@ -1,7 +1,23 @@
-import { describe, it, expect, vi } from "vitest";
-import { DebugLog, deduplicateMovements } from "./utils.js";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { DebugLog, deduplicateMovements, findChrome } from "./utils.js";
 import { MOVEMENT_SOURCE } from "./types.js";
 import type { BankMovement } from "./types.js";
+
+const ORIGINAL_ENV = { ...process.env };
+let tempRoot = "";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  process.env = { ...ORIGINAL_ENV };
+
+  if (tempRoot) {
+    fs.rmSync(tempRoot, { force: true, recursive: true });
+    tempRoot = "";
+  }
+});
 
 // ─── DebugLog ────────────────────────────────────────────────────
 
@@ -46,6 +62,24 @@ describe("DebugLog", () => {
     log.push("step 1");
     log.push("step 2");
     expect(log.join("\n")).toBe("step 1\nstep 2");
+  });
+});
+
+describe("findChrome", () => {
+  it("uses a valid explicit Chrome path first", () => {
+    expect(findChrome(process.execPath)).toBe(process.execPath);
+  });
+
+  it("detects Chrome from native Windows install roots", () => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "open-banking-chile-chrome-"));
+    const programFiles = path.join(tempRoot, "Program Files");
+    const chromePath = path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe");
+
+    fs.mkdirSync(path.dirname(chromePath), { recursive: true });
+    fs.writeFileSync(chromePath, "");
+    process.env.PROGRAMFILES = programFiles;
+
+    expect(findChrome()).toBe(chromePath);
   });
 });
 
