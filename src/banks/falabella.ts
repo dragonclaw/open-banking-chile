@@ -3,6 +3,7 @@ import * as path from "path";
 import { chromium, type Browser, type Locator, type Page } from "playwright-core";
 import type { BankMovement, BankScraper, CreditCardBalance, MovementSource, ScrapeResult, ScraperOptions } from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
+import { assertNotAborted, onAbort, SCRAPE_CANCELLED_MESSAGE } from "../infrastructure/abort.js";
 import { DebugLog, delay, deduplicateAcrossSources, deduplicateMovements, findChrome, monthYearLabel, normalizeDate, normalizeOwner, normalizeInstallments, parseChileanAmount } from "../utils.js";
 
 // ─── Constants ───────────────────────────────────────────────────
@@ -979,11 +980,20 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
     return { success: false, bank, accounts: [], error: "Debes proveer RUT y clave." };
   }
 
+  if (options.signal?.aborted) {
+    return { success: false, bank, accounts: [], error: SCRAPE_CANCELLED_MESSAGE };
+  }
+
   let browser: Browser | undefined;
+  let detachAbort: () => void = () => undefined;
 
   try {
     const session = await launchPlaywright(options);
     browser = session.browser;
+    assertNotAborted(options.signal);
+    detachAbort = onAbort(options.signal, () => {
+      void browser?.close().catch(() => {});
+    });
     const { page, debugLog } = session;
 
     // Login
@@ -1056,6 +1066,7 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
       error: `Error del scraper: ${error instanceof Error ? error.message : String(error)}`,
     };
   } finally {
+    detachAbort();
     if (browser) await browser.close().catch(() => {});
   }
 }

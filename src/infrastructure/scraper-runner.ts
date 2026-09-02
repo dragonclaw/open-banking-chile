@@ -1,5 +1,6 @@
 import type { ScrapeResult, ScraperOptions } from "../types.js";
 import { logout } from "../utils.js";
+import { assertNotAborted, onAbort, SCRAPE_CANCELLED_MESSAGE } from "./abort.js";
 import { launchBrowser, type BrowserOptions, type BrowserSession } from "./browser.js";
 
 export type ScrapeFn = (
@@ -22,7 +23,7 @@ export async function runScraper(
   browserOptions: Partial<BrowserOptions>,
   scrapeFn: ScrapeFn,
 ): Promise<ScrapeResult> {
-  const { rut, password, chromePath, saveScreenshots, headful, onDebug } = options;
+  const { rut, password, chromePath, saveScreenshots, headful, onDebug, signal } = options;
 
   if (!rut || !password) {
     return {
@@ -33,13 +34,27 @@ export async function runScraper(
     };
   }
 
+  if (signal?.aborted) {
+    return {
+      success: false,
+      bank: bankId,
+      accounts: [],
+      error: SCRAPE_CANCELLED_MESSAGE,
+    };
+  }
+
   let session: BrowserSession | undefined;
+  let detachAbort: () => void = () => undefined;
 
   try {
     session = await launchBrowser(
       { chromePath, headful, onDebug, ...browserOptions },
       !!saveScreenshots,
     );
+    assertNotAborted(signal);
+    detachAbort = onAbort(signal, () => {
+      void session?.browser.close().catch(() => {});
+    });
 
     return await scrapeFn(session, options);
   } catch (error) {
@@ -51,12 +66,24 @@ export async function runScraper(
       debug: session?.debugLog.join("\n"),
     };
   } finally {
-    if (session?.browser) {
-      try {
-        const pages = await session.browser.pages();
-        if (pages.length > 0) await logout(pages[pages.length - 1], session.debugLog);
-      } catch { /* best effort */ }
-      await session.browser.close().catch(() => {});
-    }
+    detachAbort();
+    await closeScraperSession(session);
   }
+}
+
+async function closeScraperSession(session: BrowserSession | undefined): Promise<void> {
+  if (!session?.browser) {
+    return;
+  }
+
+  try {
+    const pages = await session.browser.pages();
+    if (pages.length > 0) {
+      await logout(pages[pages.length - 1], session.debugLog);
+    }
+  } catch {
+    /* best effort */
+  }
+
+  await session.browser.close().catch(() => {});
 }

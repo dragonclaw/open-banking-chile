@@ -133,6 +133,8 @@ export interface ScraperOptions extends BankCredentials {
   onProgress?: (step: string) => void;
   /** Callback invocado en cada línea de debug en tiempo real */
   onDebug?: (line: string) => void;
+  /** Señal de cancelación para abortar el scraping en curso */
+  signal?: AbortSignal;
 }
 
 /** Interfaz que debe implementar cada banco */
