@@ -10,6 +10,76 @@ import { DebugLog, delay, deduplicateAcrossSources, deduplicateMovements, findCh
 const BANK_URL = "https://www.bancofalabella.cl";
 const MAX_PAGES = 20;
 const CMR_WAIT_MS = 30_000;
+const HOMEPAGE_TIMEOUT_MS = 20_000;
+const LOGIN_CONTROL_TIMEOUT_MS = 10_000;
+const LOGIN_OUTCOME_TIMEOUT_MS = 30_000;
+const LOGIN_OUTCOME_POLL_MS = 250;
+const PASSWORD_STEP_PROBE_MS = 1_000;
+const POST_LOGIN_RENDER_WAIT_MS = 3_000;
+const POST_LOGIN_MODAL_WAIT_MS = 2_000;
+const POST_LOGIN_MODAL_CLOSE_TIMEOUT_MS = 5_000;
+const POST_LOGIN_MODAL_REAPPEAR_WAIT_MS = 400;
+const POST_LOGIN_MODAL_MAX_CLOSE_ATTEMPTS = 4;
+const FALABELLA_POINTS_MODAL_SELECTOR = ".modal-content-secretobancario-container";
+const FALABELLA_POINTS_MODAL_CLOSE_SELECTOR = "button.close-misdocumentos";
+const AUTHENTICATED_PATH = "/web-clientes/";
+const AUTHENTICATED_ROOT_SELECTOR = "app-techbank-client-consolidated, app-root";
+const LOGIN_ERROR_SELECTOR = '[class*="error"], [class*="alert"], [role="alert"]';
+const RUT_INPUT_SELECTOR =
+  '#document, input[name="document"], input[name*="rut" i], input[id*="rut" i], input[placeholder*="RUT" i]';
+const PASSWORD_INPUT_SELECTOR =
+  '#pass, input[name="pass"], input[type="password"], input[name*="clave" i], input[id*="clave" i]';
+const LOGIN_FORM_UNAVAILABLE_ERROR =
+  "El banco cambió o no pudo mostrar su formulario de acceso.";
+const LOGIN_FORM_REJECTED_ERROR =
+  "El RUT o la clave no cumplen el formato requerido por el banco.";
+const LOGIN_OUTCOME_TIMEOUT_ERROR =
+  "El banco no confirmó el inicio de sesión dentro del tiempo esperado.";
+const SCRAPE_CANCELLED_MESSAGE = "Sincronización cancelada por el usuario.";
+
+interface ViewportSize {
+  height: number;
+  width: number;
+}
+
+interface ElementBox extends ViewportSize {
+  x: number;
+  y: number;
+}
+
+interface BannerCandidate {
+  boundingBox: () => Promise<ElementBox | null>;
+  click: () => Promise<void>;
+}
+
+interface WaitableLoginControl {
+  waitFor: (options: { state: "visible"; timeout: number }) => Promise<void>;
+}
+
+interface LoginKeyboard {
+  press: (key: string) => Promise<void>;
+}
+
+interface FalabellaLoginSnapshot {
+  bodyText: string;
+  hasAuthenticatedRoot: boolean;
+  pathname: string;
+  visibleErrors: string[];
+}
+
+type FalabellaLoginOutcome =
+  | { status: "authenticated" }
+  | { status: "error"; message: string }
+  | { status: "timeout" }
+  | { status: "two_factor" };
+
+type FalabellaLoginResult =
+  | { success: true }
+  | { success: false; error: string; screenshot?: string };
+
+class FalabellaLoginLayoutError extends Error {}
+
+class FalabellaLoginSubmissionError extends Error {}
 
 // ─── Browser helpers ─────────────────────────────────────────────
 
@@ -65,111 +135,390 @@ async function screenshotIfEnabled(page: Page, name: string, enabled: boolean, d
 
 // ─── Login ───────────────────────────────────────────────────────
 
-async function login(page: Page, rut: string, password: string, debugLog: string[], doScreenshots: boolean, progress: (s: string) => void): Promise<{ success: true } | { success: false; error: string; screenshot?: string }> {
+export function normalizeFalabellaRut(rut: string): string {
+  return rut.replace(/[^0-9kK]/g, "").toUpperCase();
+}
+
+export function isElementBoxInViewport(box: ElementBox, viewport: ViewportSize): boolean {
+  return (
+    box.width > 0 &&
+    box.height > 0 &&
+    box.x < viewport.width &&
+    box.y < viewport.height &&
+    box.x + box.width > 0 &&
+    box.y + box.height > 0
+  );
+}
+
+export async function clickFirstBannerCandidateInViewport(
+  candidates: readonly BannerCandidate[],
+  viewport: ViewportSize,
+): Promise<boolean> {
+  for (const candidate of candidates) {
+    const box = await candidate.boundingBox().catch(() => null);
+    if (!box || !isElementBoxInViewport(box, viewport)) continue;
+
+    const clicked = await candidate.click().then(() => true, () => false);
+    if (clicked) return true;
+  }
+
+  return false;
+}
+
+export async function advanceFalabellaPasswordStepIfNeeded(
+  passwordInput: WaitableLoginControl,
+  keyboard: LoginKeyboard,
+): Promise<boolean> {
+  const alreadyVisible = await passwordInput
+    .waitFor({ state: "visible", timeout: PASSWORD_STEP_PROBE_MS })
+    .then(() => true, () => false);
+  if (alreadyVisible) return false;
+
+  await keyboard.press("Enter");
+  await passwordInput.waitFor({ state: "visible", timeout: LOGIN_CONTROL_TIMEOUT_MS });
+  return true;
+}
+
+export async function navigateToFalabellaHomepage(page: Page): Promise<void> {
+  await page.goto(BANK_URL, {
+    timeout: HOMEPAGE_TIMEOUT_MS,
+    waitUntil: "domcontentloaded",
+  });
+}
+
+export function classifyFalabellaLoginSnapshot(
+  snapshot: FalabellaLoginSnapshot,
+): FalabellaLoginOutcome | null {
+  const normalizedBody = snapshot.bodyText.toLowerCase();
+  if (
+    normalizedBody.includes("clave dinámica") ||
+    normalizedBody.includes("clave dinamica") ||
+    normalizedBody.includes("segundo factor")
+  ) {
+    return { status: "two_factor" };
+  }
+
+  const errorMessage = snapshot.visibleErrors.find(
+    (message) => message.trim().length >= 4 && message.trim().length <= 200,
+  );
+  if (errorMessage) return { status: "error", message: errorMessage.trim() };
+
+  if (snapshot.pathname.includes(AUTHENTICATED_PATH) || snapshot.hasAuthenticatedRoot) {
+    return { status: "authenticated" };
+  }
+
+  return null;
+}
+
+async function login(
+  page: Page,
+  rut: string,
+  password: string,
+  debugLog: string[],
+  doScreenshots: boolean,
+  progress: (s: string) => void,
+): Promise<FalabellaLoginResult> {
   debugLog.push("1. Navigating to bank homepage...");
   progress("Abriendo sitio del banco...");
-  await page.goto(BANK_URL, { waitUntil: "networkidle" });
-  await delay(2000);
-
-  // Dismiss banners/popups
   try {
-    const acceptBtn = page.locator('button, a').filter({ hasText: /^(Aceptar|Entendido|Continuar)$/i }).first();
-    if (await acceptBtn.isVisible({ timeout: 2000 }).catch(() => false)) await acceptBtn.click();
-  } catch { /* no banner */ }
+    await navigateToFalabellaHomepage(page);
+    await dismissFalabellaHomepageBanner(page, debugLog);
+  } catch {
+    return captureFalabellaLoginFailure(page, LOGIN_FORM_UNAVAILABLE_ERROR);
+  }
   await screenshotIfEnabled(page, "01-homepage", doScreenshots, debugLog);
 
-  // Click "Mi cuenta" (triggers navigation)
-  debugLog.push("2. Clicking 'Mi cuenta'...");
+  debugLog.push("2. Opening 'Mi Cuenta' login form...");
   progress("Ingresando a Mi cuenta...");
   try {
-    await page.locator('a, button').filter({ hasText: "Mi cuenta" }).first().click({ timeout: 5000 });
-  } catch { /* may cause navigation context change */ }
-  await page.waitForLoadState("networkidle").catch(() => {});
-  await delay(3000);
+    await openFalabellaLoginForm(page);
+  } catch {
+    return captureFalabellaLoginFailure(page, LOGIN_FORM_UNAVAILABLE_ERROR);
+  }
   await screenshotIfEnabled(page, "02-login-form", doScreenshots, debugLog);
 
-  // Fill RUT
   debugLog.push("3. Filling RUT...");
   progress("Ingresando RUT...");
-  const rutInput = page.getByRole("textbox", { name: "RUT", exact: true })
-    .or(page.locator('input[name*="rut"], input[id*="rut"], input[placeholder*="RUT"]').first());
   try {
-    await rutInput.fill(rut, { timeout: 10000 });
+    await fillFalabellaLoginForm(page, rut, password, debugLog, progress);
   } catch {
-    const ss = (await page.screenshot()).toString("base64");
-    return { success: false, error: "No se encontró campo de RUT", screenshot: ss };
+    return captureFalabellaLoginFailure(page, LOGIN_FORM_UNAVAILABLE_ERROR);
   }
-  await delay(1000);
 
-  // Advance to password step (Falabella uses two-step modal)
-  await page.keyboard.press("Enter");
-  debugLog.push("  Pressed Enter to advance to password step");
-  await delay(2000);
-
-  // Fill password
-  debugLog.push("4. Filling password...");
-  progress("Ingresando clave...");
-  const pwdInput = page.locator('input[type="password"]').first()
-    .or(page.getByRole("textbox", { name: /[Cc]lave/ }).first());
-  try {
-    await pwdInput.fill(password, { timeout: 10000 });
-  } catch {
-    const ss = (await page.screenshot()).toString("base64");
-    return { success: false, error: "No se encontró campo de clave", screenshot: ss };
-  }
-  await delay(500);
-
-  // Submit login
-  debugLog.push("5. Submitting login...");
+  debugLog.push("4. Submitting login...");
   progress("Iniciando sesión...");
-  // Try clicking submit button, fallback to Enter
-  const submitBtn = page.locator('button[type="submit"], input[type="submit"]').first()
-    .or(page.getByRole("button", { name: /ingresar|entrar|btn-md/i }).first());
   try {
-    await submitBtn.click({ timeout: 3000 });
-  } catch {
-    await page.keyboard.press("Enter");
+    await submitFalabellaLoginForm(page);
+  } catch (error) {
+    const failureMessage =
+      error instanceof FalabellaLoginSubmissionError
+        ? LOGIN_FORM_REJECTED_ERROR
+        : LOGIN_FORM_UNAVAILABLE_ERROR;
+    return captureFalabellaLoginFailure(page, failureMessage);
   }
 
-  await page.waitForLoadState("networkidle").catch(() => {});
-  await delay(8000);
+  const outcome = await waitForFalabellaLoginOutcome(page);
+  if (outcome.status !== "authenticated") {
+    return captureFalabellaLoginFailure(page, getFalabellaLoginOutcomeError(outcome));
+  }
+
+  await delay(POST_LOGIN_RENDER_WAIT_MS);
   await screenshotIfEnabled(page, "03-after-login", doScreenshots, debugLog);
+  await settleFalabellaDashboard(page, debugLog);
 
-  // Close post-login popups
-  try {
-    const closeBtn = page.getByRole("button", { name: "cerrar", exact: true });
-    if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) await closeBtn.click();
-  } catch { /* no popup */ }
-
-  // Retry if products failed to load
-  try {
-    const retryBtn = page.getByText("Reintentar");
-    if (await retryBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await retryBtn.click();
-      await delay(5000);
-    }
-  } catch { /* products loaded fine */ }
-
-  // 2FA check
   const content = await page.content();
   if (content.toLowerCase().includes("clave dinámica") || content.toLowerCase().includes("segundo factor")) {
-    const ss = (await page.screenshot()).toString("base64");
-    return { success: false, error: "El banco pide clave dinámica (2FA).", screenshot: ss };
+    return captureFalabellaLoginFailure(page, "El banco pide clave dinámica (2FA).");
   }
 
-  // Error check
-  const errorText = await page.locator('[class*="error"], [class*="alert"], [role="alert"]')
-    .first()
-    .textContent({ timeout: 2000 })
-    .catch(() => null);
-  if (errorText && errorText.trim().length > 5 && errorText.trim().length < 200) {
-    const ss = (await page.screenshot()).toString("base64");
-    return { success: false, error: `Error del banco: ${errorText.trim()}`, screenshot: ss };
-  }
-
-  debugLog.push("6. Login OK!");
+  debugLog.push("5. Login OK!");
   progress("Sesión iniciada correctamente");
   return { success: true };
+}
+
+async function dismissFalabellaHomepageBanner(
+  page: Page,
+  debugLog: string[],
+): Promise<void> {
+  const controls = page
+    .locator("button, a")
+    .filter({ hasText: /^(Aceptar|Entendido|Continuar)$/i });
+  const viewport = page.viewportSize();
+  if (!viewport) return;
+
+  const candidates = Array.from({ length: await controls.count() }, (_, index) => {
+    const control = controls.nth(index);
+    return {
+      boundingBox: () => control.boundingBox(),
+      click: () => control.click({ timeout: 2_000 }),
+    };
+  });
+  if (await clickFirstBannerCandidateInViewport(candidates, viewport)) {
+    debugLog.push("  Dismissed homepage banner");
+  }
+}
+
+async function openFalabellaLoginForm(page: Page): Promise<void> {
+  const accountControl = page
+    .getByRole("button", { name: /^mi cuenta$/i })
+    .or(page.getByRole("link", { name: /^mi cuenta$/i }))
+    .first();
+
+  try {
+    await accountControl.waitFor({ state: "visible", timeout: LOGIN_CONTROL_TIMEOUT_MS });
+    await accountControl.click({ timeout: LOGIN_CONTROL_TIMEOUT_MS });
+    await getFalabellaRutInput(page).waitFor({
+      state: "visible",
+      timeout: LOGIN_CONTROL_TIMEOUT_MS,
+    });
+  } catch {
+    throw new FalabellaLoginLayoutError(LOGIN_FORM_UNAVAILABLE_ERROR);
+  }
+}
+
+async function fillFalabellaLoginForm(
+  page: Page,
+  rut: string,
+  password: string,
+  debugLog: string[],
+  progress: (step: string) => void,
+): Promise<void> {
+  const passwordInput = getFalabellaPasswordInput(page);
+
+  try {
+    await getFalabellaRutInput(page).fill(normalizeFalabellaRut(rut), {
+      timeout: LOGIN_CONTROL_TIMEOUT_MS,
+    });
+    const advanced = await advanceFalabellaPasswordStepIfNeeded(
+      passwordInput,
+      page.keyboard,
+    );
+    if (advanced) debugLog.push("  Advanced to legacy password step");
+    debugLog.push("  Filling password...");
+    progress("Ingresando clave...");
+    await passwordInput.fill(password, { timeout: LOGIN_CONTROL_TIMEOUT_MS });
+  } catch {
+    throw new FalabellaLoginLayoutError(LOGIN_FORM_UNAVAILABLE_ERROR);
+  }
+}
+
+async function submitFalabellaLoginForm(page: Page): Promise<void> {
+  const submitButton = page
+    .getByRole("button", { name: /ingresar|entrar/i })
+    .or(page.locator('button[type="submit"], input[type="submit"]'))
+    .first();
+
+  try {
+    await submitButton.waitFor({ state: "visible", timeout: LOGIN_CONTROL_TIMEOUT_MS });
+  } catch {
+    throw new FalabellaLoginLayoutError(LOGIN_FORM_UNAVAILABLE_ERROR);
+  }
+
+  try {
+    await submitButton.click({ timeout: LOGIN_CONTROL_TIMEOUT_MS });
+  } catch {
+    throw new FalabellaLoginSubmissionError(LOGIN_FORM_REJECTED_ERROR);
+  }
+}
+
+function getFalabellaRutInput(page: Page): Locator {
+  return page
+    .locator(RUT_INPUT_SELECTOR)
+    .or(page.getByRole("textbox", { name: /^RUT$/i }))
+    .first();
+}
+
+function getFalabellaPasswordInput(page: Page): Locator {
+  return page
+    .locator(PASSWORD_INPUT_SELECTOR)
+    .or(page.getByLabel(/clave|contraseña/i))
+    .first();
+}
+
+async function waitForFalabellaLoginOutcome(page: Page): Promise<FalabellaLoginOutcome> {
+  const deadline = Date.now() + LOGIN_OUTCOME_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const snapshot = await readFalabellaLoginSnapshot(page).catch(() => null);
+    const outcome = snapshot ? classifyFalabellaLoginSnapshot(snapshot) : null;
+    if (outcome) return outcome;
+    await delay(LOGIN_OUTCOME_POLL_MS);
+  }
+
+  return { status: "timeout" };
+}
+
+async function readFalabellaLoginSnapshot(page: Page): Promise<FalabellaLoginSnapshot> {
+  return page.evaluate(
+    ({ authenticatedRootSelector, errorSelector }) => {
+      const isVisible = (element: Element): boolean => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return (
+          rect.width > 0 &&
+          rect.height > 0 &&
+          style.display !== "none" &&
+          style.visibility !== "hidden"
+        );
+      };
+      const visibleErrors = Array.from(document.querySelectorAll(errorSelector))
+        .filter(isVisible)
+        .map((element) => (element.textContent ?? "").trim())
+        .filter(Boolean);
+
+      return {
+        bodyText: document.body?.innerText ?? "",
+        hasAuthenticatedRoot: Boolean(document.querySelector(authenticatedRootSelector)),
+        pathname: window.location.pathname,
+        visibleErrors,
+      };
+    },
+    {
+      authenticatedRootSelector: AUTHENTICATED_ROOT_SELECTOR,
+      errorSelector: LOGIN_ERROR_SELECTOR,
+    },
+  );
+}
+
+function getFalabellaLoginOutcomeError(outcome: FalabellaLoginOutcome): string {
+  if (outcome.status === "two_factor") return "El banco pide clave dinámica (2FA).";
+  if (outcome.status === "error") return `Error del banco: ${outcome.message}`;
+  return LOGIN_OUTCOME_TIMEOUT_ERROR;
+}
+
+async function captureFalabellaLoginFailure(
+  page: Page,
+  error: string,
+): Promise<FalabellaLoginResult> {
+  const screenshot = await page
+    .screenshot()
+    .then((value) => value.toString("base64"))
+    .catch(() => undefined);
+
+  return screenshot
+    ? { success: false, error, screenshot }
+    : { success: false, error };
+}
+
+export async function dismissFalabellaPointsModal(
+  page: Page,
+  debugLog: string[] = [],
+  options: { waitMs?: number } = {},
+): Promise<boolean> {
+  const waitMs = options.waitMs ?? POST_LOGIN_MODAL_WAIT_MS;
+  let dismissed = false;
+
+  for (let attempt = 0; attempt < POST_LOGIN_MODAL_MAX_CLOSE_ATTEMPTS; attempt += 1) {
+    const timeout = attempt === 0 ? waitMs : POST_LOGIN_MODAL_REAPPEAR_WAIT_MS;
+    const appeared = await falabellaPointsModalIsVisible(page, timeout);
+    if (!appeared) break;
+
+    await closeFalabellaPointsModal(page);
+    dismissed = true;
+    debugLog.push(
+      attempt === 0
+        ? "  Closed CMR Puntos opt-in modal"
+        : "  Closed CMR Puntos opt-in modal again",
+    );
+  }
+
+  return dismissed;
+}
+
+async function falabellaPointsModalIsVisible(page: Page, waitMs: number): Promise<boolean> {
+  const closeButton = page
+    .locator(FALABELLA_POINTS_MODAL_SELECTOR)
+    .first()
+    .locator(FALABELLA_POINTS_MODAL_CLOSE_SELECTOR)
+    .first();
+
+  if (waitMs <= 0) {
+    return closeButton.isVisible().catch(() => false);
+  }
+
+  return closeButton
+    .waitFor({ state: "visible", timeout: waitMs })
+    .then(() => true, () => false);
+}
+
+async function closeFalabellaPointsModal(page: Page): Promise<void> {
+  const modal = page.locator(FALABELLA_POINTS_MODAL_SELECTOR).first();
+  const closeButton = modal.locator(FALABELLA_POINTS_MODAL_CLOSE_SELECTOR).first();
+  await closeButton.click({ timeout: POST_LOGIN_MODAL_CLOSE_TIMEOUT_MS });
+  await modal
+    .waitFor({ state: "hidden", timeout: POST_LOGIN_MODAL_CLOSE_TIMEOUT_MS })
+    .catch(() => {});
+}
+
+async function dismissFalabellaGenericClosePopup(page: Page, debugLog: string[]): Promise<void> {
+  const closeButton = page.getByRole("button", { name: "cerrar", exact: true });
+  if (!(await closeButton.isVisible({ timeout: 500 }).catch(() => false))) return;
+
+  await closeButton.click({ timeout: 2_000 }).catch(() => {});
+  debugLog.push("  Closed generic popup");
+}
+
+async function clearFalabellaBlockingOverlays(
+  page: Page,
+  debugLog: string[],
+  waitMs = POST_LOGIN_MODAL_WAIT_MS,
+): Promise<void> {
+  await dismissFalabellaPointsModal(page, debugLog, { waitMs });
+  await dismissFalabellaGenericClosePopup(page, debugLog);
+  if (waitMs > 0) {
+    await dismissFalabellaPointsModal(page, debugLog, { waitMs: POST_LOGIN_MODAL_REAPPEAR_WAIT_MS });
+  }
+}
+
+async function settleFalabellaDashboard(page: Page, debugLog: string[]): Promise<void> {
+  await clearFalabellaBlockingOverlays(page, debugLog);
+
+  const retryButton = page.getByText("Reintentar");
+  if (await retryButton.isVisible().catch(() => false)) {
+    await retryButton.click({ timeout: 2_000 }).catch(() => {});
+    await delay(5_000);
+    await clearFalabellaBlockingOverlays(page, debugLog);
+  }
 }
 
 // ─── Account movements ──────────────────────────────────────────
@@ -177,6 +526,7 @@ async function login(page: Page, rut: string, password: string, debugLog: string
 async function scrapeAccountMovements(page: Page, debugLog: string[], doScreenshots: boolean, progress: (s: string) => void): Promise<{ movements: BankMovement[]; balance?: number }> {
   debugLog.push("7. [Cuenta] Looking for account...");
   progress("Buscando cartola de cuenta...");
+  await clearFalabellaBlockingOverlays(page, debugLog, 0);
 
   // Try clicking on Cuenta Corriente product card
   const ccLink = page.getByRole("link", { name: /Cuenta Corriente \d/ });
@@ -184,8 +534,9 @@ async function scrapeAccountMovements(page: Page, debugLog: string[], doScreensh
 
   if (await ccLink.isVisible({ timeout: 5000 }).catch(() => false)) {
     await ccLink.click();
-    await page.waitForLoadState("networkidle").catch(() => {});
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
     await delay(3000);
+    await clearFalabellaBlockingOverlays(page, debugLog);
     navigated = true;
   }
 
@@ -195,8 +546,10 @@ async function scrapeAccountMovements(page: Page, debugLog: string[], doScreensh
       const link = page.locator("a, button, [role='tab']").filter({ hasText: new RegExp(text, "i") }).first();
       if (await link.isVisible({ timeout: 2000 }).catch(() => false)) {
         try {
+          await clearFalabellaBlockingOverlays(page, debugLog, 0);
           await link.click();
           await delay(4000);
+          await clearFalabellaBlockingOverlays(page, debugLog);
           navigated = true;
           break;
         } catch { /* try next */ }
@@ -208,11 +561,14 @@ async function scrapeAccountMovements(page: Page, debugLog: string[], doScreensh
     // Try clicking any account-like element
     const acctEl = page.locator("a, div, button").filter({ hasText: /cuenta corriente|cuenta vista/i }).first();
     if (await acctEl.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await clearFalabellaBlockingOverlays(page, debugLog, 0);
       await acctEl.click();
       await delay(4000);
+      await clearFalabellaBlockingOverlays(page, debugLog);
     }
   }
 
+  await clearFalabellaBlockingOverlays(page, debugLog, 0);
   await screenshotIfEnabled(page, "05-account-movements", doScreenshots, debugLog);
 
   // Expand date range if possible
@@ -240,6 +596,7 @@ async function scrapeAccountMovements(page: Page, debugLog: string[], doScreensh
 
 async function tryExpandDateRange(page: Page, debugLog: string[]): Promise<void> {
   try {
+    await clearFalabellaBlockingOverlays(page, debugLog, 0);
     const selects = page.locator("select");
     const count = await selects.count();
     for (let i = 0; i < count; i++) {
@@ -251,6 +608,7 @@ async function tryExpandDateRange(page: Page, debugLog: string[]): Promise<void>
           await sel.selectOption({ label: text });
           debugLog.push(`  Changed select to "${text}"`);
           await delay(3000);
+          await clearFalabellaBlockingOverlays(page, debugLog);
           break;
         }
       }
@@ -348,6 +706,7 @@ async function paginateAccountMovements(page: Page, debugLog: string[]): Promise
   const all: BankMovement[] = [];
 
   for (let i = 0; i < MAX_PAGES; i++) {
+    await dismissFalabellaPointsModal(page, debugLog, { waitMs: 0 });
     const movements = await extractMovementsFromPage(page);
     all.push(...movements);
 
@@ -358,8 +717,10 @@ async function paginateAccountMovements(page: Page, debugLog: string[]): Promise
       if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
         const disabled = await btn.isDisabled().catch(() => true);
         if (!disabled) {
+          await dismissFalabellaPointsModal(page, debugLog, { waitMs: 0 });
           await btn.click();
           await delay(2500);
+          await clearFalabellaBlockingOverlays(page, debugLog);
           clicked = true;
           debugLog.push(`  Pagination: loaded page ${i + 2}`);
           break;
@@ -380,6 +741,7 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
 
   debugLog.push("9. [CMR] Looking for CMR card...");
   progress("Navegando a tarjeta de crédito...");
+  await clearFalabellaBlockingOverlays(page, debugLog, 0);
 
   // Extract cupos from dashboard
   const cupoData = await extractCupos(page, debugLog);
@@ -391,12 +753,14 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
     return { movements: [], creditCard };
   }
 
-  await page.waitForLoadState("networkidle").catch(() => {});
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
   await delay(5000);
+  await clearFalabellaBlockingOverlays(page, debugLog);
   await screenshotIfEnabled(page, "06-cmr-card", doScreenshots, debugLog);
 
   // Wait for CMR shadow DOM to render
   await waitForCmrContent(page, CMR_WAIT_MS);
+  await clearFalabellaBlockingOverlays(page, debugLog, 0);
 
   // Owner filter
   if (ownerFilter !== "B") {
@@ -407,6 +771,7 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
       if (select) { select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); }
     }, { host: "credit-card-movements", value: ownerFilter });
     await waitForCmrContent(page, CMR_WAIT_MS);
+    await clearFalabellaBlockingOverlays(page, debugLog, 0);
   }
 
   // ── No facturados (default tab) ────────────────────────────────
@@ -429,11 +794,14 @@ async function scrapeCreditCard(page: Page, debugLog: string[], doScreenshots: b
   debugLog.push("11. [CMR] Switching to facturados tab...");
   progress("Extrayendo movimientos TC facturados...");
 
+  await clearFalabellaBlockingOverlays(page, debugLog, 0);
   const tabClicked = await clickCmrTab(page, debugLog);
   if (tabClicked) {
     await delay(2000);
+    await clearFalabellaBlockingOverlays(page, debugLog);
     await waitForCmrContent(page, CMR_WAIT_MS);
     await delay(3000);
+    await clearFalabellaBlockingOverlays(page, debugLog, 0);
     await screenshotIfEnabled(page, "07-cmr-facturados", doScreenshots, debugLog);
 
     // Extract last statement info
@@ -500,11 +868,13 @@ async function clickCmrProductCard(page: Page, debugLog: string[]): Promise<bool
     try {
       await candidate.locator.scrollIntoViewIfNeeded();
     } catch { /* best effort */ }
+    await dismissFalabellaPointsModal(page, debugLog, { waitMs: 0 });
     await candidate.locator.click({ timeout: 5000 });
     debugLog.push(`  [CMR] Clicked card via ${candidate.label}`);
     return true;
   }
 
+  await dismissFalabellaPointsModal(page, debugLog, { waitMs: 0 });
   const clicked = await page.evaluate(() => {
     function clickElement(element: HTMLElement): void {
       element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
@@ -781,6 +1151,7 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
   const host = "credit-card-movements";
 
   for (let i = 0; i < MAX_PAGES; i++) {
+    await dismissFalabellaPointsModal(page, debugLog, { waitMs: 0 });
     // Extract + click next in a single evaluate
     const result: { rows: BankMovement[]; firstRow: string; clicked: boolean } = await page.evaluate(
       ({ host: h, src, isBilled }: { host: string; src: string; isBilled: boolean }) => {
@@ -956,6 +1327,7 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
 
     if (!changed) break;
     await delay(300);
+    await clearFalabellaBlockingOverlays(page, debugLog);
   }
 
   return deduplicateMovements(
@@ -971,7 +1343,13 @@ async function paginateCmrMovements(page: Page, source: MovementSource, debugLog
 // ─── Main scrape function ────────────────────────────────────────
 
 async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
-  const { rut, password, saveScreenshots: doScreenshots = false, owner = "B" } = options;
+  const {
+    rut,
+    password,
+    saveScreenshots: doScreenshots = false,
+    owner = "B",
+    signal,
+  } = options;
   const progress = options.onProgress || (() => {});
   const bank = "falabella";
 
@@ -979,11 +1357,27 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
     return { success: false, bank, accounts: [], error: "Debes proveer RUT y clave." };
   }
 
+  if (signal?.aborted) {
+    return buildCancelledFalabellaResult();
+  }
+
   let browser: Browser | undefined;
+  const closeBrowserOnAbort = (): void => {
+    if (browser) {
+      void browser.close().catch(() => {});
+    }
+  };
 
   try {
     const session = await launchPlaywright(options);
     browser = session.browser;
+    signal?.addEventListener("abort", closeBrowserOnAbort, { once: true });
+
+    if (signal?.aborted) {
+      closeBrowserOnAbort();
+      return buildCancelledFalabellaResult(session.debugLog);
+    }
+
     const { page, debugLog } = session;
 
     // Login
@@ -1008,14 +1402,9 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
     // Phase 2: CMR credit card — navigate back to dashboard first
     debugLog.push("  Navigating back to dashboard for CMR...");
     progress("Navegando a tarjeta de crédito...");
-    await page.goto(dashboardUrl, { waitUntil: "networkidle" });
+    await page.goto(dashboardUrl, { waitUntil: "domcontentloaded" });
     await delay(2000);
-
-    // Close popups again
-    try {
-      const closeBtn = page.getByRole("button", { name: "cerrar", exact: true });
-      if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) await closeBtn.click();
-    } catch { /* no popup */ }
+    await clearFalabellaBlockingOverlays(page, debugLog);
 
     const { creditCard } = await scrapeCreditCard(page, debugLog, doScreenshots, progress, owner);
 
@@ -1040,6 +1429,10 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
       await delay(2000);
     } catch { /* best effort */ }
 
+    if (signal?.aborted) {
+      return buildCancelledFalabellaResult(debugLog);
+    }
+
     return {
       success: true,
       bank,
@@ -1049,6 +1442,10 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
       debug: debugLog.join("\n"),
     };
   } catch (error) {
+    if (signal?.aborted) {
+      return buildCancelledFalabellaResult();
+    }
+
     return {
       success: false,
       bank,
@@ -1056,8 +1453,19 @@ async function scrapeFalabella(options: ScraperOptions): Promise<ScrapeResult> {
       error: `Error del scraper: ${error instanceof Error ? error.message : String(error)}`,
     };
   } finally {
+    signal?.removeEventListener("abort", closeBrowserOnAbort);
     if (browser) await browser.close().catch(() => {});
   }
+}
+
+function buildCancelledFalabellaResult(debugLog: string[] = []): ScrapeResult {
+  return {
+    success: false,
+    bank: "falabella",
+    accounts: [],
+    error: SCRAPE_CANCELLED_MESSAGE,
+    debug: debugLog.join("\n"),
+  };
 }
 
 // ─── Export ──────────────────────────────────────────────────────

@@ -2,6 +2,8 @@ import type { ScrapeResult, ScraperOptions } from "../types.js";
 import { logout } from "../utils.js";
 import { launchBrowser, type BrowserOptions, type BrowserSession } from "./browser.js";
 
+const SCRAPE_CANCELLED_MESSAGE = "Sincronización cancelada por el usuario.";
+
 export type ScrapeFn = (
   session: BrowserSession,
   options: ScraperOptions,
@@ -22,7 +24,7 @@ export async function runScraper(
   browserOptions: Partial<BrowserOptions>,
   scrapeFn: ScrapeFn,
 ): Promise<ScrapeResult> {
-  const { rut, password, chromePath, saveScreenshots, headful, onDebug } = options;
+  const { rut, password, chromePath, saveScreenshots, headful, onDebug, signal } = options;
 
   if (!rut || !password) {
     return {
@@ -33,16 +35,39 @@ export async function runScraper(
     };
   }
 
+  if (signal?.aborted) {
+    return buildCancelledScrapeResult(bankId);
+  }
+
   let session: BrowserSession | undefined;
+  const closeBrowserOnAbort = (): void => {
+    if (session?.browser) {
+      void session.browser.close().catch(() => {});
+    }
+  };
 
   try {
     session = await launchBrowser(
       { chromePath, headful, onDebug, ...browserOptions },
       !!saveScreenshots,
     );
+    signal?.addEventListener("abort", closeBrowserOnAbort, { once: true });
 
-    return await scrapeFn(session, options);
+    if (signal?.aborted) {
+      closeBrowserOnAbort();
+      return buildCancelledScrapeResult(bankId);
+    }
+
+    const result = await scrapeFn(session, options);
+
+    return signal?.aborted
+      ? buildCancelledScrapeResult(bankId, session.debugLog)
+      : result;
   } catch (error) {
+    if (signal?.aborted) {
+      return buildCancelledScrapeResult(bankId, session?.debugLog);
+    }
+
     return {
       success: false,
       bank: bankId,
@@ -51,6 +76,8 @@ export async function runScraper(
       debug: session?.debugLog.join("\n"),
     };
   } finally {
+    signal?.removeEventListener("abort", closeBrowserOnAbort);
+
     if (session?.browser) {
       try {
         const pages = await session.browser.pages();
@@ -59,4 +86,17 @@ export async function runScraper(
       await session.browser.close().catch(() => {});
     }
   }
+}
+
+function buildCancelledScrapeResult(
+  bankId: string,
+  debugLog: string[] = [],
+): ScrapeResult {
+  return {
+    success: false,
+    bank: bankId,
+    accounts: [],
+    error: SCRAPE_CANCELLED_MESSAGE,
+    debug: debugLog.join("\n"),
+  };
 }
