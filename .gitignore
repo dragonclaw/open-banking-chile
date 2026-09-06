@@ -4,5 +4,6 @@ dist/
 *.log
 screenshots/
 debug/
+.browser-profiles/
 .DS_Store
 .claude/

@@ -31,7 +31,7 @@ async function fillRut(page: Page, rut: string): Promise<boolean> {
   });
   if (isReadonly) await delay(300);
 
-  await rutInput.click({ clickCount: 3 });
+  await rutInput.click({ count: 3 });
   const cleanRut = rut.replace(/[.\-]/g, "");
   await rutInput.type(cleanRut, { delay: 80 });
 
@@ -51,7 +51,7 @@ async function fillPassword(page: Page, password: string): Promise<boolean> {
   const passInput = await page.$("#pass");
   if (!passInput) return false;
 
-  await passInput.click({ clickCount: 3 });
+  await passInput.click({ count: 3 });
   await passInput.type(password, { delay: 80 });
 
   await page.evaluate(() => {

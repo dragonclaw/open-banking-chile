@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { DebugLog, findChrome, saveScreenshot } from "../utils.js";
 
@@ -7,6 +8,13 @@ export interface BrowserOptions {
   /** Force headless mode off (e.g., Banco Estado TLS fingerprinting) */
   forceHeadful?: boolean;
   extraArgs?: string[];
+  /** Replaces the default Chrome args when provided */
+  customArgs?: string[];
+  ignoreDefaultArgs?: string[];
+  userDataDir?: string;
+  extraHeaders?: Record<string, string>;
+  /** Keep Chrome's real user agent instead of the shared Windows override */
+  preserveUserAgent?: boolean;
   viewport?: { width: number; height: number };
   /** Callback invocado en cada línea de debug en tiempo real */
   onDebug?: (line: string) => void;
@@ -54,7 +62,19 @@ export async function launchBrowser(
   options: BrowserOptions,
   saveScreenshots: boolean,
 ): Promise<BrowserSession> {
-  const { chromePath, headful, forceHeadful, extraArgs, viewport, onDebug } = options;
+  const {
+    chromePath,
+    headful,
+    forceHeadful,
+    extraArgs,
+    customArgs,
+    ignoreDefaultArgs,
+    userDataDir,
+    extraHeaders,
+    preserveUserAgent,
+    viewport,
+    onDebug,
+  } = options;
   const debugLog: string[] = onDebug ? new DebugLog(onDebug) : [];
 
   // Some banks (e.g. BancoEstado) block headless browsers via TLS fingerprinting
@@ -78,16 +98,27 @@ export async function launchBrowser(
     );
   }
 
+  if (userDataDir) {
+    fs.mkdirSync(userDataDir, { recursive: true });
+  }
+
   const browser = await puppeteer.launch({
     executablePath,
     headless: forceHeadful ? false : !headful,
-    args: [...DEFAULT_ARGS, ...(extraArgs || [])],
+    args: [...(customArgs ?? DEFAULT_ARGS), ...(extraArgs || [])],
+    ...(ignoreDefaultArgs ? { ignoreDefaultArgs } : {}),
+    ...(userDataDir ? { userDataDir } : {}),
   });
 
   const page = await browser.newPage();
   const vp = viewport || { width: 1280, height: 900 };
   await page.setViewport(vp);
-  await page.setUserAgent(DEFAULT_UA);
+  if (!preserveUserAgent) {
+    await page.setUserAgent(DEFAULT_UA);
+  }
+  if (extraHeaders) {
+    await page.setExtraHTTPHeaders(extraHeaders);
+  }
 
   // Hide automation signals
   await page.evaluateOnNewDocument(() => {

@@ -1,0 +1,1301 @@
+diff --git a/.env.example b/.env.example
+index 08abcf7..8b21fa8 100644
+--- a/.env.example
++++ b/.env.example
+@@ -28,6 +28,8 @@ BESTADO_PASS=tu_clave_aqui
+ # FALABELLA_OWNER=B
+ # Opcional [SCOTIABANK]:
+ # SCOTIABANK_MONTHS=3
++# Directorio persistente y privado para cookies de seguridad del navegador
++# SCOTIABANK_USER_DATA_DIR=.browser-profiles/scotiabank
+ # Opcional [BCHILE]: segundos máximos para esperar aprobación manual de 2FA (default: 180)
+ # BCHILE_2FA_TIMEOUT_SEC=240
+ # Opcional [SANTANDER]: segundos máximos para esperar aprobación manual de 2FA (default: 180)
+diff --git a/.gitignore b/.gitignore
+index 69c75dd..2ef9fa7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,5 +4,6 @@ dist/
+ *.log
+ screenshots/
+ debug/
++.browser-profiles/
+ .DS_Store
+ .claude/
+diff --git a/src/banks/scotiabank.ts b/src/banks/scotiabank.ts
+index d3565eb..e3246f3 100644
+--- a/src/banks/scotiabank.ts
++++ b/src/banks/scotiabank.ts
+@@ -1,4 +1,17 @@
+-import type { Frame, Page } from "puppeteer-core";
++import * as fs from "fs";
++import { spawn, type ChildProcess } from "child_process";
++import { createServer } from "net";
++import { homedir } from "os";
++import * as path from "path";
++import {
++  chromium,
++  type Browser,
++  type BrowserContext as PlaywrightBrowserContext,
++  type Frame,
++  type Locator,
++  type Page,
++  type Response,
++} from "playwright-core";
+ import {
+   MOVEMENT_SOURCE,
+   type BankMovement,
+@@ -9,21 +22,13 @@ import {
+   type ScraperOptions,
+ } from "../types.js";
+ import {
+-  closePopups,
++  DebugLog,
+   delay,
+   deduplicateMovements,
++  findChrome,
+   normalizeDate,
+   parseChileanAmount,
+ } from "../utils.js";
+-import { runScraper } from "../infrastructure/scraper-runner.js";
+-import type { BrowserSession } from "../infrastructure/browser.js";
+-import {
+-  fillRut,
+-  fillPassword,
+-  clickSubmit,
+-  detectLoginError,
+-} from "../actions/login.js";
+-import { dismissBanners } from "../actions/navigation.js";
+ import {
+   isScotiabankFullAccountPage,
+   parseScotiabankAccountMovements,
+@@ -34,20 +39,46 @@ import {
+ // ─── Scotiabank-specific constants ───────────────────────────────
+ 
+ const BANK_URL = "https://www.scotiabank.cl";
++const AUTH_CALLBACK_PATH = "/mfe-login/api/auth/callback/enigma";
++const LOGIN_CALLBACK_TIMEOUT_MS = 30_000;
++const LOGIN_MAX_ATTEMPTS = 3;
++const SECURITY_SENSOR_SETTLE_MS = 8_000;
++const SCOTIABANK_ACCEPT_LANGUAGE =
++  "en-CL,en;q=0.9,es-US;q=0.8,es;q=0.7,en-US;q=0.6";
++const SCOTIABANK_CHROME_VERSION = "152.0.0.0";
++const SCOTIABANK_WINDOWS_PLATFORM_VERSION = "19.0.0";
++const SCOTIABANK_WINDOWS_RENDERER =
++  "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 (0x00002786) Direct3D11 vs_5_0 ps_5_0, D3D11)";
++const SCRAPE_CANCELLED_MESSAGE = "Sincronización cancelada por el usuario.";
++const WINDOWS_EXECUTABLE_PATTERN = /^\/mnt\/([a-z])\/(.+\.exe)$/i;
++const WINDOWS_NATIVE_PATH_PATTERN = /^[a-z]:[\\/].+\.exe$/i;
++const WSL_WINDOWS_CHROME_CANDIDATES = [
++  "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
++  "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe",
++];
+ 
+ const LOGIN_SELECTORS = {
+   rutSelectors: [
++    '[data-testid="inputDni"]',
++    "#login-retail-content-card-form-input-dni-input",
++    'input[name="userId"]',
++    'input[placeholder*="RUT"]',
+     "#inputDni",
+     'input[name="inputDni"]',
+     'input[id*="Dni"]',
+     'input[name*="Dni"]',
+   ],
+   passwordSelectors: [
++    '[data-testid="inputPassword"]',
++    "#login-retail-content-card-form-input-password-input",
++    'input[name="pass"]',
++    'input[placeholder*="contraseña"]',
+     "#inputPassword",
+     'input[name="inputPassword"]',
+     'input[id*="Password"]',
+     'input[name*="Password"]',
+   ],
++  submitSelectors: ['button[type="submit"]', 'input[type="submit"]'],
+   rutFormat: "dash" as const,
+ };
+ 
+@@ -68,19 +99,22 @@ function allDeepJs(): string {
+ 
+ // ─── Scotiabank-specific helpers ─────────────────────────────────
+ 
+-async function waitForDashboardContent(page: Page): Promise<void> {
++async function waitForDashboardContent(page: Page): Promise<boolean> {
+   const start = Date.now();
+   while (Date.now() - start < 15000) {
+-    const hasContent = await page.evaluate(
+-      new Function(`${allDeepJs()}
++    const hasContent = await page
++      .evaluate(
++        new Function(`${allDeepJs()}
+       return allDeep(document, "a, button, span").some(el => {
+         const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+         return text === "ver saldos y últimos movimientos" || text === "ver saldos y ultimos movimientos" || text === "cuenta corriente";
+       });`) as () => boolean,
+-    );
+-    if (hasContent) break;
++      )
++      .catch(() => false);
++    if (hasContent) return true;
+     await delay(1500);
+   }
++  return false;
+ }
+ 
+ async function dismissScotiaTutorial(
+@@ -106,6 +140,35 @@ async function dismissScotiaTutorial(
+ 
+ type BrowserContext = Page | Frame;
+ 
++interface ScotiabankSession {
++  browser: Browser;
++  browserProcess: ChildProcess;
++  context: PlaywrightBrowserContext;
++  debugLog: string[];
++  page: Page;
++  relayProcess?: ChildProcess;
++  screenshot: (page: Page, name: string) => Promise<void>;
++}
++
++type ScotiabankLoginResult =
++  | { success: true }
++  | { error: string; screenshot?: string; success: false };
++
++export type ScotiabankAuthCallbackOutcome =
++  | "accepted"
++  | "blocked"
++  | "credentials_rejected"
++  | "unexpected";
++
++export function classifyScotiabankAuthCallback(
++  status: number,
++): ScotiabankAuthCallbackOutcome {
++  if (status === 200) return "accepted";
++  if (status === 401) return "credentials_rejected";
++  if (status === 403) return "blocked";
++  return "unexpected";
++}
++
+ type CreditCardMovementTab = "billed" | "unbilled";
+ 
+ interface RawScotiabankCreditCardMovement {
+@@ -707,7 +770,11 @@ async function clickDeepTextInContexts(
+ async function readAccountPageState(
+   ctx: BrowserContext,
+ ): Promise<ScotiabankAccountPageState | null> {
+-  return await ctx.evaluate(readScotiabankAccountPageState).catch(() => null);
++  return await ctx
++    .evaluate(
++      readScotiabankAccountPageState as () => ScotiabankAccountPageState,
++    )
++    .catch(() => null);
+ }
+ 
+ async function findFullAccountContext(page: Page): Promise<{
+@@ -758,7 +825,9 @@ async function readCreditCardPageState(
+   ctx: BrowserContext,
+ ): Promise<ScotiabankCreditCardPageState | null> {
+   return await ctx
+-    .evaluate(readScotiabankCreditCardPageState)
++    .evaluate(
++      readScotiabankCreditCardPageState as () => ScotiabankCreditCardPageState,
++    )
+     .catch(() => null);
+ }
+ 
+@@ -1008,7 +1077,7 @@ async function gotoCreditCardStatementTab(
+ ): Promise<boolean> {
+   try {
+     await page.goto(buildCreditCardStatementUrl(page, tab), {
+-      waitUntil: "networkidle2",
++      waitUntil: "domcontentloaded",
+       timeout: 20000,
+     });
+     debugLog.push(`  TC direct URL: ${tab}`);
+@@ -1507,122 +1576,805 @@ async function fillAndSubmitDateRange(
+ 
+ // ─── Main scrape function ────────────────────────────────────────
+ 
+-async function scrapeScotiabank(
+-  session: BrowserSession,
++async function launchScotiabankPlaywright(
+   options: ScraperOptions,
+-): Promise<ScrapeResult> {
+-  const { rut, password, saveScreenshots: doScreenshots, onProgress } = options;
+-  const { page, debugLog, screenshot: doSave } = session;
+-  const progress = onProgress || (() => {});
+-  const bank = "scotiabank";
++): Promise<ScotiabankSession> {
++  const executablePath = findScotiabankChrome(options.chromePath);
++  if (!executablePath) {
++    throw new Error(
++      "No se encontró Chrome/Chromium. Instala Google Chrome o configura CHROME_PATH.",
++    );
++  }
++
++  const debugLog: string[] = options.onDebug
++    ? new DebugLog(options.onDebug)
++    : [];
++  const configuredProfileDirectory =
++    process.env.SCOTIABANK_USER_DATA_DIR?.trim();
++  const profileDirectory = resolveScotiabankProfileDirectory(
++    executablePath,
++    configuredProfileDirectory,
++  );
++  const isWindowsChromeFromWsl =
++    WINDOWS_EXECUTABLE_PATTERN.test(executablePath);
++  const usesNativeWindowsChrome =
++    isWindowsChromeFromWsl || WINDOWS_NATIVE_PATH_PATTERN.test(executablePath);
++  const debugPort = await reserveLocalPort();
++  const relayPort = isWindowsChromeFromWsl
++    ? await reserveLocalPort()
++    : undefined;
++  const browserProcess = spawn(
++    executablePath,
++    [
++      `--remote-debugging-port=${debugPort}`,
++      "--remote-debugging-address=127.0.0.1",
++      `--user-data-dir=${profileDirectory}`,
++      "--no-first-run",
++      "--no-default-browser-check",
++      "--no-sandbox",
++      "--disable-setuid-sandbox",
++      "--disable-dev-shm-usage",
++      "--disable-blink-features=AutomationControlled",
++      "--disable-notifications",
++      "--enable-gpu",
++      "--lang=en-CL",
++      "--start-maximized",
++      "about:blank",
++    ],
++    { stdio: "ignore" },
++  );
++  const relayProcess = relayPort
++    ? launchWslWindowsTcpRelay(relayPort, debugPort)
++    : undefined;
++  const endpoint = relayPort
++    ? `http://${resolveWslWindowsHost()}:${relayPort}`
++    : `http://127.0.0.1:${debugPort}`;
++  await waitForChromeDebugEndpoint(endpoint, browserProcess, relayProcess);
++  const browser = await chromium.connectOverCDP(endpoint);
++  const context = browser.contexts()[0];
++  if (!context) {
++    browserProcess.kill();
++    relayProcess?.kill();
++    throw new Error("Chrome no creó un contexto de navegador.");
++  }
++  const page = context.pages()[0] ?? (await context.newPage());
++  if (!usesNativeWindowsChrome) {
++    await configureScotiabankWindowsIdentity(context, page);
++    await installScotiabankFingerprintRoute(page);
++  }
++  await page.setExtraHTTPHeaders({
++    "Accept-Language": SCOTIABANK_ACCEPT_LANGUAGE,
++    DNT: "1",
++  });
++  const screenshot = async (targetPage: Page, name: string): Promise<void> => {
++    if (!options.saveScreenshots) return;
++    const safeName = name.replace(/[/\\:*?"<>|]/g, "_");
++    const directory = path.resolve("screenshots");
++    if (!fs.existsSync(directory)) fs.mkdirSync(directory, { recursive: true });
++    await targetPage.screenshot({
++      fullPage: true,
++      path: path.join(directory, `${safeName}.png`),
++    });
++    debugLog.push(`  Screenshot saved: screenshots/${safeName}.png`);
++  };
++
++  if (options.onDebug) attachScotiabankNetworkDiagnostics(page, debugLog);
++  return {
++    browser,
++    browserProcess,
++    context,
++    debugLog,
++    page,
++    relayProcess,
++    screenshot,
++  };
++}
++
++function findScotiabankChrome(customPath?: string): string | null {
++  if (customPath) return findChrome(customPath);
++  const isWsl =
++    process.platform === "linux" &&
++    (Boolean(process.env.WSL_INTEROP) || Boolean(process.env.WSL_DISTRO_NAME));
++  if (isWsl) {
++    const windowsChrome = WSL_WINDOWS_CHROME_CANDIDATES.find((candidate) =>
++      fs.existsSync(candidate),
++    );
++    if (windowsChrome) return windowsChrome;
++  }
++  return findChrome();
++}
++
++async function configureScotiabankWindowsIdentity(
++  context: PlaywrightBrowserContext,
++  page: Page,
++): Promise<void> {
++  const fullVersion = SCOTIABANK_CHROME_VERSION;
++  const majorVersion = fullVersion.split(".")[0] || "146";
++  const userAgent =
++    `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ` +
++    `(KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`;
++  const brandVersion = { brand: "Google Chrome", version: majorVersion };
++  const chromiumVersion = { brand: "Chromium", version: majorVersion };
++  const cdpSession = await context.newCDPSession(page);
++  await cdpSession.send("Network.setUserAgentOverride", {
++    acceptLanguage: SCOTIABANK_ACCEPT_LANGUAGE,
++    platform: "Win32",
++    userAgent,
++    userAgentMetadata: {
++      architecture: "x86",
++      bitness: "64",
++      brands: [
++        chromiumVersion,
++        { brand: "Not-A.Brand", version: "24" },
++        brandVersion,
++      ],
++      fullVersion,
++      fullVersionList: [
++        { brand: "Chromium", version: fullVersion },
++        { brand: "Not-A.Brand", version: "24.0.0.0" },
++        { brand: "Google Chrome", version: fullVersion },
++      ],
++      mobile: false,
++      model: "",
++      platform: "Windows",
++      platformVersion: SCOTIABANK_WINDOWS_PLATFORM_VERSION,
++      wow64: false,
++    },
++  });
++  await cdpSession.send("Emulation.setLocaleOverride", { locale: "en-CL" });
++  await page.addInitScript(
++    ({ renderer }) => {
++      Object.defineProperty(navigator, "deviceMemory", { get: () => 32 });
++      Object.defineProperty(navigator, "platform", { get: () => "Win32" });
++      Object.defineProperty(navigator, "webdriver", { get: () => false });
++      Object.defineProperty(screen, "availHeight", { get: () => 1032 });
++      type WebGlContext = WebGLRenderingContext | WebGL2RenderingContext;
++      const overrideWebGl = (
++        prototype:
++          | typeof WebGLRenderingContext.prototype
++          | typeof WebGL2RenderingContext.prototype,
++      ): void => {
++        const getExtension = prototype.getExtension as unknown as (
++          this: WebGlContext,
++          name: string,
++        ) => unknown;
++        const getParameter = prototype.getParameter as unknown as (
++          this: WebGlContext,
++          parameter: number,
++        ) => unknown;
++        prototype.getExtension = function (
++          this: WebGlContext,
++          name: string,
++        ): unknown {
++          if (name === "WEBGL_debug_renderer_info") {
++            return {
++              UNMASKED_RENDERER_WEBGL: 37446,
++              UNMASKED_VENDOR_WEBGL: 37445,
++            };
++          }
++          return getExtension.call(this, name);
++        } as typeof prototype.getExtension;
++        prototype.getParameter = function (
++          this: WebGlContext,
++          parameter: number,
++        ): unknown {
++          if (parameter === 37445) return "Google Inc. (NVIDIA)";
++          if (parameter === 37446) return renderer;
++          return getParameter.call(this, parameter);
++        };
++      };
++      overrideWebGl(WebGLRenderingContext.prototype);
++      if (typeof WebGL2RenderingContext !== "undefined") {
++        overrideWebGl(WebGL2RenderingContext.prototype);
++      }
++    },
++    { renderer: SCOTIABANK_WINDOWS_RENDERER },
++  );
++}
++
++export function resolveScotiabankProfileDirectory(
++  executablePath: string,
++  configuredDirectory?: string,
++): string {
++  const windowsExecutable = executablePath.match(WINDOWS_EXECUTABLE_PATTERN);
++  if (!windowsExecutable) {
++    return path.resolve(
++      configuredDirectory || path.join(".browser-profiles", "scotiabank"),
++    );
++  }
++
++  if (configuredDirectory && /^[a-z]:[\\/]/i.test(configuredDirectory)) {
++    return configuredDirectory.replaceAll("/", "\\");
++  }
++
++  if (configuredDirectory) {
++    const mountedPath = path
++      .resolve(configuredDirectory)
++      .match(/^\/mnt\/([a-z])\/(.*)$/i);
++    if (mountedPath) {
++      return `${mountedPath[1]?.toUpperCase()}:\\${mountedPath[2]?.replaceAll("/", "\\")}`;
++    }
++  }
++
++  const drive = windowsExecutable[1]?.toUpperCase() ?? "C";
++  const username = path.basename(homedir());
++  return `${drive}:\\Users\\${username}\\AppData\\Local\\open-banking-chile\\scotiabank`;
++}
++
++export function resolveWslWindowsHost(
++  routeTable = fs.readFileSync("/proc/net/route", "utf8"),
++): string {
++  const defaultRoute = routeTable
++    .split("\n")
++    .map((line) => line.trim().split(/\s+/))
++    .find((columns) => columns[1] === "00000000" && columns[2]?.length === 8);
++  const gatewayHex = defaultRoute?.[2];
++  if (!gatewayHex) {
++    throw new Error("No se pudo resolver la IP de Windows desde WSL2.");
++  }
++  const octets = gatewayHex.match(/.{2}/g)?.reverse();
++  if (!octets) {
++    throw new Error("La ruta predeterminada de WSL2 no es válida.");
++  }
++  return octets.map((octet) => Number.parseInt(octet, 16)).join(".");
++}
++
++function launchWslWindowsTcpRelay(
++  relayPort: number,
++  targetPort: number,
++): ChildProcess {
++  const powershellPath =
++    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
++  const script = [
++    `$listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Any,${relayPort})`,
++    "$listener.Start()",
++    "while($true){",
++    "$client=$listener.AcceptTcpClient()",
++    "$target=[Net.Sockets.TcpClient]::new()",
++    `try{$target.Connect([Net.IPAddress]::Loopback,${targetPort})`,
++    "$left=$client.GetStream()",
++    "$right=$target.GetStream()",
++    "$a=$left.CopyToAsync($right)",
++    "$b=$right.CopyToAsync($left)",
++    "[Threading.Tasks.Task]::WaitAny(@($a,$b))|Out-Null",
++    "}finally{$client.Dispose();$target.Dispose()}",
++    "}",
++  ].join(";");
++  return spawn(
++    powershellPath,
++    ["-NoProfile", "-NonInteractive", "-Command", script],
++    { stdio: "ignore" },
++  );
++}
++
++export function normalizeScotiabankFingerprint(encoded: string): string {
++  try {
++    const fingerprint = JSON.parse(
++      Buffer.from(encoded, "base64").toString("utf8"),
++    ) as Record<string, unknown>;
++    const browser = getRecord(fingerprint.Browser);
++    const general = getRecord(fingerprint.General);
++    const personalization = getRecord(fingerprint.Personalization);
++    if (!browser || !general || !personalization) return encoded;
++
++    Object.assign(browser, {
++      browserMajor: "152",
++      browserVersion: SCOTIABANK_CHROME_VERSION,
++      osName: "Windows",
++      osVersion: "10",
++      userAgent:
++        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
++        "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
++    });
++    Object.assign(general, {
++      availableResolution: "1920x1032",
++      deviceMemory: "32",
++      hardwareConcurrency: "16",
++      language: "en-CL",
++      navigatorPlatform: "Win32",
++      rendererVideo: SCOTIABANK_WINDOWS_RENDERER,
++      resolution: "1920x1080",
++      vendorWebGL: "1",
++    });
++    Object.assign(personalization, { numberFonts: "33", numberPlugins: "5" });
++    return Buffer.from(JSON.stringify(fingerprint), "utf8").toString("base64");
++  } catch {
++    return encoded;
++  }
++}
++
++function getRecord(value: unknown): Record<string, unknown> | null {
++  return value && typeof value === "object" && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : null;
++}
++
++async function installScotiabankFingerprintRoute(page: Page): Promise<void> {
++  await page.route(`**${AUTH_CALLBACK_PATH}`, async (route) => {
++    const request = route.request();
++    const postData = request.postData();
++    if (!postData) {
++      await route.continue();
++      return;
++    }
++    const form = new URLSearchParams(postData);
++    const fingerprint = form.get("xFingerPrintDevice");
++    if (!fingerprint) {
++      await route.continue();
++      return;
++    }
++    form.set("xFingerPrintDevice", normalizeScotiabankFingerprint(fingerprint));
++    await route.continue({ postData: form.toString() });
++  });
++}
++
++async function reserveLocalPort(): Promise<number> {
++  return await new Promise((resolve, reject) => {
++    const server = createServer();
++    server.once("error", reject);
++    server.listen(0, "127.0.0.1", () => {
++      const address = server.address();
++      if (!address || typeof address === "string") {
++        server.close();
++        reject(new Error("No se pudo reservar un puerto local para Chrome."));
++        return;
++      }
++      server.close((error) => (error ? reject(error) : resolve(address.port)));
++    });
++  });
++}
++
++async function waitForChromeDebugEndpoint(
++  endpoint: string,
++  browserProcess: ChildProcess,
++  relayProcess?: ChildProcess,
++): Promise<void> {
++  const deadline = Date.now() + 15_000;
++  while (Date.now() < deadline) {
++    if (browserProcess.exitCode !== null && !relayProcess) {
++      throw new Error(
++        `Chrome terminó antes de iniciar (HTTP ${browserProcess.exitCode}).`,
++      );
++    }
++    if (
++      relayProcess?.exitCode !== null &&
++      relayProcess?.exitCode !== undefined
++    ) {
++      browserProcess.kill();
++      throw new Error(
++        "El puente local entre WSL2 y Chrome terminó antes de iniciar.",
++      );
++    }
++    const ready = await fetch(`${endpoint}/json/version`)
++      .then((response) => response.ok)
++      .catch(() => false);
++    if (ready) return;
++    await delay(200);
++  }
++  browserProcess.kill();
++  relayProcess?.kill();
++  throw new Error("Chrome no habilitó el canal local de depuración.");
++}
++
++function attachScotiabankNetworkDiagnostics(
++  page: Page,
++  debugLog: string[],
++): void {
++  page.on("response", (response) => {
++    void logScotiabankNetworkResponse(response, debugLog);
++  });
++}
++
++async function logScotiabankNetworkResponse(
++  response: Response,
++  debugLog: string[],
++): Promise<void> {
++  try {
++    const url = new URL(response.url());
++    if (url.pathname !== AUTH_CALLBACK_PATH) return;
++    const server = response.headers()["server"] ?? "unknown";
++    debugLog.push(
++      `[network] HTTP ${response.status()} POST ${url.origin}${url.pathname} server=${server}`,
++    );
++    const request = response.request();
++    const headers = await request.allHeaders();
++    const akamaiCookie = (
++      await response.frame().page().context().cookies(response.url())
++    ).find((cookie) => cookie.name === "_abck");
++    const akamaiSegments = akamaiCookie?.value.split("~") ?? [];
++    const cookieNames = (headers.cookie ?? "")
++      .split(";")
++      .map((cookie) => cookie.split("=", 1)[0]?.trim())
++      .filter(Boolean);
++    const form = new URLSearchParams(request.postData() ?? "");
++    const encodedFingerprint = form.get("xFingerPrintDevice");
++    let fingerprint: unknown = null;
++    if (encodedFingerprint) {
++      try {
++        const parsed = JSON.parse(
++          Buffer.from(encodedFingerprint, "base64").toString("utf8"),
++        ) as Record<string, unknown>;
++        fingerprint = {
++          Alterations: parsed.Alterations,
++          Browser: parsed.Browser,
++          General: parsed.General,
++          Personalization: parsed.Personalization,
++          Site:
++            parsed.Site && typeof parsed.Site === "object"
++              ? {
++                  ...(parsed.Site as Record<string, unknown>),
++                  href: "[redacted query]",
++                }
++              : parsed.Site,
++        };
++      } catch {
++        fingerprint = "[invalid fingerprint]";
++      }
++    }
++    debugLog.push(
++      `[network-profile] ${JSON.stringify({
++        akamaiState: akamaiCookie
++          ? {
++              sensorLength: akamaiSegments[2]?.length ?? 0,
++              status: akamaiSegments[1] ?? "unknown",
++            }
++          : null,
++        cookieNames,
++        fingerprint,
++        headers: {
++          accept: headers.accept,
++          acceptLanguage: headers["accept-language"],
++          dnt: headers.dnt,
++          origin: headers.origin,
++          referer: headers.referer ? "[redacted query]" : undefined,
++          secChUa: headers["sec-ch-ua"],
++          secChUaMobile: headers["sec-ch-ua-mobile"],
++          secChUaPlatform: headers["sec-ch-ua-platform"],
++          userAgent: headers["user-agent"],
++        },
++        payloadKeys: Array.from(form.keys()),
++      })}`,
++    );
++  } catch {
++    // Ignore malformed diagnostic URLs.
++  }
++}
++
++async function dismissScotiabankBanners(page: Page): Promise<void> {
++  const controls = page
++    .locator("button, a")
++    .filter({ hasText: /^(Aceptar|Entendido|Continuar|Cerrar)$/i });
++  const count = await controls.count();
++  for (let index = 0; index < count; index++) {
++    const control = controls.nth(index);
++    if (await control.isVisible().catch(() => false)) {
++      await control.click({ timeout: 2_000 }).catch(() => {});
++      return;
++    }
++  }
++}
++
++async function closeScotiabankPopups(page: Page): Promise<void> {
++  for (let index = 0; index < 5; index++) {
++    await page.keyboard.press("Escape");
++    await delay(300);
++  }
++  await page.evaluate(() => {
++    const controls = document.querySelectorAll(
++      '[class*="close"], [aria-label*="close"], [aria-label*="cerrar"], button',
++    );
++    for (const control of Array.from(controls)) {
++      const text = (control as HTMLElement).innerText?.trim();
++      if (["X", "×", "✕", "Cerrar"].includes(text))
++        (control as HTMLElement).click();
++    }
++  });
++  await delay(1_000);
++}
++
++function formatScotiabankRut(rut: string): string {
++  const cleanRut = rut.replace(/[.\-]/g, "");
++  return `${cleanRut.slice(0, -1)}-${cleanRut.slice(-1)}`;
++}
++
++async function clickWithMouse(page: Page, locator: Locator): Promise<void> {
++  const box = await locator.boundingBox();
++  if (!box) {
++    await locator.click({ timeout: 10_000 });
++    return;
++  }
++  await page.mouse.move(40, 40);
++  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, {
++    steps: 24,
++  });
++  await delay(180);
++  await page.mouse.down();
++  await delay(90);
++  await page.mouse.up();
++}
++
++async function fillFirstVisible(
++  page: Page,
++  selectors: readonly string[],
++  value: string,
++  timeoutMs = 15_000,
++): Promise<boolean> {
++  const deadline = Date.now() + timeoutMs;
++  while (Date.now() < deadline) {
++    for (const selector of selectors) {
++      const field = page.locator(selector).first();
++      if (!(await field.isVisible().catch(() => false))) continue;
++      await clickWithMouse(page, field);
++      await field.pressSequentially(value, { delay: 45 });
++      await field.blur();
++      return true;
++    }
++    await delay(250);
++  }
++  return false;
++}
++
++async function clickScotiabankSubmit(page: Page): Promise<void> {
++  const submit = page
++    .locator(LOGIN_SELECTORS.submitSelectors.join(", "))
++    .or(page.getByRole("button", { name: /ingresar|entrar/i }))
++    .first();
++  await submit.waitFor({ state: "visible", timeout: 10_000 });
++  await clickWithMouse(page, submit);
++}
++
++async function settleScotiabankSecuritySensors(page: Page): Promise<void> {
++  const viewport = page.viewportSize() ?? { height: 900, width: 1280 };
++  const points = [
++    { x: viewport.width * 0.25, y: viewport.height * 0.3 },
++    { x: viewport.width * 0.65, y: viewport.height * 0.45 },
++    { x: viewport.width * 0.45, y: viewport.height * 0.7 },
++  ];
++  for (const point of points) {
++    await page.mouse.move(point.x, point.y, { steps: 16 });
++    await delay(400);
++  }
++  await delay(SECURITY_SENSOR_SETTLE_MS);
++}
++
++function isScotiabankAuthCallback(response: Response): boolean {
++  try {
++    return (
++      response.request().method() === "POST" &&
++      new URL(response.url()).pathname === AUTH_CALLBACK_PATH
++    );
++  } catch {
++    return false;
++  }
++}
+ 
+-  // 1. Navigate
++function isScotiabankDashboardUrl(url: string): boolean {
++  return /\/mfe-home-cl\//.test(url);
++}
++
++async function submitScotiabankLoginWithRetries(
++  page: Page,
++  debugLog: string[],
++): Promise<Response | null> {
++  for (let attempt = 1; attempt <= LOGIN_MAX_ATTEMPTS; attempt++) {
++    debugLog.push(`5.${attempt}. Submitting login...`);
++    const callbackPromise = page.waitForResponse(isScotiabankAuthCallback, {
++      timeout: LOGIN_CALLBACK_TIMEOUT_MS,
++    });
++    await clickScotiabankSubmit(page);
++    const callback = await callbackPromise.catch(() => null);
++    if (
++      !callback ||
++      callback.status() !== 403 ||
++      attempt === LOGIN_MAX_ATTEMPTS
++    ) {
++      return callback;
++    }
++    debugLog.push(
++      `  Akamai blocked attempt ${attempt}; keeping the session and retrying...`,
++    );
++    await settleScotiabankSecuritySensors(page);
++  }
++  return null;
++}
++
++async function captureScotiabankFailure(
++  page: Page,
++  error: string,
++): Promise<ScotiabankLoginResult> {
++  const screenshot = (await page.screenshot({ fullPage: true })).toString(
++    "base64",
++  );
++  return { error, screenshot, success: false };
++}
++
++async function detectScotiabankLoginError(page: Page): Promise<string | null> {
++  const messages = await page
++    .locator(
++      '[class*="error"], [class*="alert"], [role="alert"], [class*="warning"]',
++    )
++    .allTextContents()
++    .catch(() => []);
++  const pattern =
++    /(error|incorrect|inv[aá]lid|rechazad|bloquead|fall[oó]|credencial|autentic|clave|rut)/i;
++  return (
++    messages
++      .find((message) => {
++        const text = message.trim();
++        return text.length >= 4 && text.length <= 250 && pattern.test(text);
++      })
++      ?.trim() ?? null
++  );
++}
++
++async function loginScotiabank(
++  page: Page,
++  rut: string,
++  password: string,
++  debugLog: string[],
++  doSave: ScotiabankSession["screenshot"],
++  progress: (step: string) => void,
++): Promise<ScotiabankLoginResult> {
+   debugLog.push("1. Navigating to Scotiabank...");
+   progress("Abriendo sitio del banco...");
+-  await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 });
+-  await delay(2000);
+-  await dismissBanners(page);
++  await page.goto(BANK_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
++  await delay(2_000);
++  await dismissScotiabankBanners(page);
+   await doSave(page, "01-homepage");
+ 
+-  // 2. Login
+   debugLog.push("2. Clicking login button...");
+-  await page.evaluate(() => {
+-    for (const el of Array.from(document.querySelectorAll("a, button"))) {
+-      const text = (el as HTMLElement).innerText?.trim().toLowerCase() || "";
+-      const href = (el as HTMLAnchorElement).href || "";
+-      if (
+-        text === "ingresar" ||
+-        text === "acceso clientes" ||
+-        text.includes("iniciar sesión") ||
+-        href.includes("login") ||
+-        href.includes("auth")
+-      ) {
+-        (el as HTMLElement).click();
+-        return;
+-      }
+-    }
++  const loginHref = await page
++    .locator('a[href*="/login/personas"]')
++    .first()
++    .getAttribute("href");
++  if (!loginHref) {
++    return captureScotiabankFailure(
++      page,
++      "No se encontró el acceso de clientes.",
++    );
++  }
++  await page.goto(new URL(loginHref, page.url()).toString(), {
++    referer: page.url(),
++    timeout: 30_000,
++    waitUntil: "domcontentloaded",
+   });
+-  await delay(4000);
++  await page.waitForURL(
++    (url) =>
++      /banco\.scotiabank\.cl\/mfe-login\//.test(url.toString()) ||
++      isScotiabankDashboardUrl(url.toString()),
++    { timeout: 20_000, waitUntil: "domcontentloaded" },
++  );
++  if (isScotiabankDashboardUrl(page.url())) {
++    debugLog.push("3. Reusing the authenticated Scotiabank session.");
++    const dashboardLoaded = await waitForDashboardContent(page);
++    if (!dashboardLoaded) {
++      return captureScotiabankFailure(
++        page,
++        "Scotiabank abrió la sesión existente, pero no cargó el dashboard.",
++      );
++    }
++    await closeScotiabankPopups(page);
++    await dismissScotiaTutorial(page, debugLog);
++    return { success: true };
++  }
+   await doSave(page, "02-login-form");
+ 
+   debugLog.push("3. Filling RUT...");
+   progress("Ingresando RUT...");
+-  if (!(await fillRut(page, rut, LOGIN_SELECTORS))) {
+-    const ss = await page.screenshot({ encoding: "base64" });
+-    return {
+-      success: false,
+-      bank,
+-      accounts: [],
+-      error: "No se encontró campo de RUT",
+-      screenshot: ss as string,
+-      debug: debugLog.join("\n"),
+-    };
+-  }
+-  await delay(1000);
++  const rutFilled = await fillFirstVisible(
++    page,
++    LOGIN_SELECTORS.rutSelectors,
++    formatScotiabankRut(rut),
++  );
++  if (!rutFilled)
++    return captureScotiabankFailure(page, "No se encontró campo de RUT");
+ 
+   debugLog.push("4. Filling password...");
+-  let passOk = await fillPassword(page, password, LOGIN_SELECTORS);
+-  if (!passOk) {
++  let passwordFilled = await fillFirstVisible(
++    page,
++    LOGIN_SELECTORS.passwordSelectors,
++    password,
++    1_000,
++  );
++  if (!passwordFilled) {
+     await page.keyboard.press("Enter");
+-    await delay(3000);
+-    passOk = await fillPassword(page, password, LOGIN_SELECTORS);
+-  }
+-  if (!passOk) {
+-    const ss = await page.screenshot({ encoding: "base64" });
+-    return {
+-      success: false,
+-      bank,
+-      accounts: [],
+-      error: "No se encontró campo de clave",
+-      screenshot: ss as string,
+-      debug: debugLog.join("\n"),
+-    };
++    passwordFilled = await fillFirstVisible(
++      page,
++      LOGIN_SELECTORS.passwordSelectors,
++      password,
++      10_000,
++    );
+   }
+-  await delay(800);
++  if (!passwordFilled)
++    return captureScotiabankFailure(page, "No se encontró campo de clave");
++  await settleScotiabankSecuritySensors(page);
+ 
+-  debugLog.push("5. Submitting login...");
+   progress("Iniciando sesión...");
+-  await clickSubmit(page, page, LOGIN_SELECTORS);
+-  await delay(8000);
+-  await doSave(page, "03-after-login");
++  const callback = await submitScotiabankLoginWithRetries(page, debugLog);
++  if (!callback) {
++    return captureScotiabankFailure(
++      page,
++      "Scotiabank no respondió al intento de inicio de sesión.",
++    );
++  }
++  const callbackOutcome = classifyScotiabankAuthCallback(callback.status());
++  if (callbackOutcome === "credentials_rejected") {
++    return captureScotiabankFailure(
++      page,
++      "Scotiabank rechazó el RUT o la clave.",
++    );
++  }
++  if (callbackOutcome === "blocked") {
++    return captureScotiabankFailure(
++      page,
++      "Scotiabank bloqueó la solicitud de acceso antes de validar las credenciales.",
++    );
++  }
++  if (callbackOutcome === "unexpected") {
++    return captureScotiabankFailure(
++      page,
++      `Scotiabank respondió con HTTP ${callback.status()} al iniciar sesión.`,
++    );
++  }
+ 
+-  // 2FA check
++  const dashboardLoaded = await waitForDashboardContent(page);
++  await doSave(page, "03-after-login");
+   const pageContent = (await page.content()).toLowerCase();
+   if (
+     pageContent.includes("clave dinámica") ||
+     pageContent.includes("segundo factor") ||
+-    pageContent.includes("código de verificación") ||
+-    pageContent.includes("token")
++    pageContent.includes("código de verificación")
+   ) {
+-    const ss = await page.screenshot({ encoding: "base64" });
+-    return {
+-      success: false,
+-      bank,
+-      accounts: [],
+-      error: "El banco pide clave dinámica o 2FA.",
+-      screenshot: ss as string,
+-      debug: debugLog.join("\n"),
+-    };
++    return captureScotiabankFailure(
++      page,
++      "El banco pide clave dinámica o 2FA.",
++    );
++  }
++  const loginError = await detectScotiabankLoginError(page);
++  if (loginError)
++    return captureScotiabankFailure(page, `Error del banco: ${loginError}`);
++  if (!dashboardLoaded) {
++    return captureScotiabankFailure(
++      page,
++      "Scotiabank aceptó el login, pero no cargó el dashboard.",
++    );
+   }
+ 
+-  const loginError = await detectLoginError(page);
+-  if (loginError) {
+-    const ss = await page.screenshot({ encoding: "base64" });
++  debugLog.push("6. Login OK!");
++  progress("Sesión iniciada correctamente");
++  await closeScotiabankPopups(page);
++  await dismissScotiaTutorial(page, debugLog);
++  return { success: true };
++}
++
++async function scrapeScotiabank(
++  session: ScotiabankSession,
++  options: ScraperOptions,
++): Promise<ScrapeResult> {
++  const { rut, password, saveScreenshots: doScreenshots, onProgress } = options;
++  const { page, debugLog, screenshot: doSave } = session;
++  const progress = onProgress || (() => {});
++  const bank = "scotiabank";
++
++  const loginResult = await loginScotiabank(
++    page,
++    rut,
++    password,
++    debugLog,
++    doSave,
++    progress,
++  );
++  if (!loginResult.success) {
+     return {
+-      success: false,
+-      bank,
+       accounts: [],
+-      error: `Error del banco: ${loginError}`,
+-      screenshot: ss as string,
++      bank,
+       debug: debugLog.join("\n"),
++      error: loginResult.error,
++      screenshot: loginResult.screenshot,
++      success: false,
+     };
+   }
+ 
+-  debugLog.push("6. Login OK!");
+-  progress("Sesión iniciada correctamente");
+-  await closePopups(page);
+-  await dismissScotiaTutorial(page, debugLog);
+-
+   // 7. Navigate to cartola
+   debugLog.push("7. Looking for Cartola/Movimientos...");
+   progress("Buscando cartola de cuenta...");
+@@ -1663,7 +2415,7 @@ async function scrapeScotiabank(
+           text.includes("mes anterior")
+         ) {
+           await page.evaluate(
+-            (selIdx: number, optValue: string) => {
++            ({ selIdx, optValue }: { selIdx: number; optValue: string }) => {
+               const selects = document.querySelectorAll("select");
+               const select = selects[selIdx] as HTMLSelectElement;
+               if (select) {
+@@ -1671,8 +2423,7 @@ async function scrapeScotiabank(
+                 select.dispatchEvent(new Event("change", { bubbles: true }));
+               }
+             },
+-            sel.index,
+-            opt.value,
++            { optValue: opt.value, selIdx: sel.index },
+           );
+           await delay(3000);
+           break;
+@@ -1741,7 +2492,7 @@ async function scrapeScotiabank(
+         : currentUrl + (currentUrl.includes("?") ? "&" : "?") + "tab=cartolas";
+       try {
+         await page.goto(cartolasUrl, {
+-          waitUntil: "networkidle2",
++          waitUntil: "domcontentloaded",
+           timeout: 15000,
+         });
+         clickedVerCartolas = true;
+@@ -1899,7 +2650,7 @@ async function scrapeScotiabank(
+               }
+ 
+               const filled = await frame.evaluate(
+-                (monthIdx: number, year: number) => {
++                ({ monthIdx, year }: { monthIdx: number; year: number }) => {
+                   const selects = Array.from(
+                     document.querySelectorAll("select"),
+                   ) as HTMLSelectElement[];
+@@ -1925,8 +2676,7 @@ async function scrapeScotiabank(
+ 
+                   return "ok";
+                 },
+-                targetMonth,
+-                targetYear,
++                { monthIdx: targetMonth, year: targetYear },
+               );
+ 
+               debugLog.push(`    Fill result: ${filled}`);
+@@ -2049,10 +2799,7 @@ async function scrapeScotiabank(
+ 
+   await doSave(page, "05-final");
+   const ss = doScreenshots
+-    ? ((await page.screenshot({
+-        encoding: "base64",
+-        fullPage: true,
+-      })) as string)
++    ? (await page.screenshot({ fullPage: true })).toString("base64")
+     : undefined;
+ 
+   return {
+@@ -2065,13 +2812,135 @@ async function scrapeScotiabank(
+   };
+ }
+ 
++async function logoutScotiabank(page: Page, debugLog: string[]): Promise<void> {
++  try {
++    const clicked = await page.evaluate(() => {
++      for (const element of Array.from(
++        document.querySelectorAll("a, button, span, div, li"),
++      )) {
++        const text = (element as HTMLElement).innerText?.trim().toLowerCase();
++        if (
++          [
++            "cerrar sesión",
++            "cerrar sesion",
++            "salir",
++            "logout",
++            "sign out",
++          ].includes(text)
++        ) {
++          (element as HTMLElement).click();
++          return true;
++        }
++      }
++      return false;
++    });
++    if (clicked) {
++      debugLog.push("  Logged out successfully");
++      await delay(2_000);
++    }
++  } catch {
++    // Closing the isolated browser context also ends the session.
++  }
++}
++
++async function closeScotiabankBrowser(
++  session: ScotiabankSession,
++): Promise<void> {
++  try {
++    const cdpSession = await session.context.newCDPSession(session.page);
++    await cdpSession.send("Browser.close");
++  } catch {
++    await session.browser.close().catch(() => {});
++  } finally {
++    session.browserProcess.kill();
++    session.relayProcess?.kill();
++  }
++}
++
++async function runScotiabankPlaywright(
++  options: ScraperOptions,
++): Promise<ScrapeResult> {
++  const bank = "scotiabank";
++  if (!options.rut || !options.password) {
++    return {
++      accounts: [],
++      bank,
++      error: "Debes proveer RUT y clave.",
++      success: false,
++    };
++  }
++  if (options.signal?.aborted) {
++    return {
++      accounts: [],
++      bank,
++      error: SCRAPE_CANCELLED_MESSAGE,
++      success: false,
++    };
++  }
++
++  let session: ScotiabankSession | undefined;
++  const closeBrowserOnAbort = (): void => {
++    if (session) {
++      void closeScotiabankBrowser(session);
++    }
++  };
++  try {
++    session = await launchScotiabankPlaywright(options);
++    options.signal?.addEventListener("abort", closeBrowserOnAbort, {
++      once: true,
++    });
++    if (options.signal?.aborted) {
++      closeBrowserOnAbort();
++      return {
++        accounts: [],
++        bank,
++        debug: session.debugLog.join("\n"),
++        error: SCRAPE_CANCELLED_MESSAGE,
++        success: false,
++      };
++    }
++    const result = await scrapeScotiabank(session, options);
++    return options.signal?.aborted
++      ? {
++          accounts: [],
++          bank,
++          debug: session.debugLog.join("\n"),
++          error: SCRAPE_CANCELLED_MESSAGE,
++          success: false,
++        }
++      : result;
++  } catch (error) {
++    if (options.signal?.aborted) {
++      return {
++        accounts: [],
++        bank,
++        error: SCRAPE_CANCELLED_MESSAGE,
++        success: false,
++      };
++    }
++    return {
++      accounts: [],
++      bank,
++      debug: session?.debugLog.join("\n"),
++      error: `Error del scraper: ${error instanceof Error ? error.message : String(error)}`,
++      success: false,
++    };
++  } finally {
++    options.signal?.removeEventListener("abort", closeBrowserOnAbort);
++    if (session) {
++      await logoutScotiabank(session.page, session.debugLog);
++      await closeScotiabankBrowser(session);
++    }
++  }
++}
++
+ // ─── Export ──────────────────────────────────────────────────────
+ 
+ const scotiabank: BankScraper = {
+   id: "scotiabank",
+   name: "Scotiabank Chile",
+   url: BANK_URL,
+-  scrape: (options) => runScraper("scotiabank", options, {}, scrapeScotiabank),
++  scrape: runScotiabankPlaywright,
+ };
+ 
+ export default scotiabank;
