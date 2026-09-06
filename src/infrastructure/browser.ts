@@ -110,7 +110,9 @@ export async function launchBrowser(
     ...(userDataDir ? { userDataDir } : {}),
   });
 
+  const restoredPages = await browser.pages();
   const page = await browser.newPage();
+  await Promise.all(restoredPages.map((restoredPage) => restoredPage.close().catch(() => {})));
   const vp = viewport || { width: 1280, height: 900 };
   await page.setViewport(vp);
   if (!preserveUserAgent) {

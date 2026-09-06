@@ -18,7 +18,7 @@ vi.mock("../utils.js", () => ({
 
 import { runScraper } from "./scraper-runner.js";
 
-describe("runScraper cancellation", () => {
+describe("runScraper lifecycle", () => {
   beforeEach(() => {
     launchBrowserMock.mockReset();
     logoutMock.mockReset();
@@ -50,6 +50,7 @@ describe("runScraper cancellation", () => {
 
   it("closes Chrome and returns a cancelled result when aborted during scraping", async () => {
     const close = vi.fn().mockResolvedValue(undefined);
+    const pageClose = vi.fn().mockResolvedValue(undefined);
     const abortController = new AbortController();
     launchBrowserMock.mockResolvedValue({
       browser: {
@@ -57,7 +58,7 @@ describe("runScraper cancellation", () => {
         pages: vi.fn().mockResolvedValue([]),
       },
       debugLog: [],
-      page: {},
+      page: { close: pageClose },
       screenshot: vi.fn(),
     });
     const scrapeFn = vi.fn(
@@ -89,11 +90,47 @@ describe("runScraper cancellation", () => {
     const result = await runPromise;
 
     expect(close).toHaveBeenCalled();
+    expect(pageClose).toHaveBeenCalled();
     expect(result).toEqual(
       expect.objectContaining({
         error: "Sincronización cancelada por el usuario.",
         success: false,
       }),
+    );
+  });
+
+  it("logs out and closes every page before closing the browser", async () => {
+    const browserClose = vi.fn().mockResolvedValue(undefined);
+    const pageClose = vi.fn().mockResolvedValue(undefined);
+    const popupClose = vi.fn().mockResolvedValue(undefined);
+    const page = { close: pageClose };
+    const popup = { close: popupClose };
+    launchBrowserMock.mockResolvedValue({
+      browser: {
+        close: browserClose,
+        pages: vi.fn().mockResolvedValue([popup, page]),
+      },
+      debugLog: [],
+      page,
+      screenshot: vi.fn(),
+    });
+
+    const result = await runScraper(
+      "test-bank",
+      { password: "secret", rut: "11111111-1" },
+      {},
+      vi.fn().mockResolvedValue({ success: true, bank: "test-bank", accounts: [] }),
+    );
+
+    expect(result.success).toBe(true);
+    expect(logoutMock).toHaveBeenCalledWith(page, []);
+    expect(pageClose).toHaveBeenCalledOnce();
+    expect(popupClose).toHaveBeenCalledOnce();
+    expect(pageClose.mock.invocationCallOrder[0]).toBeLessThan(
+      browserClose.mock.invocationCallOrder[0],
+    );
+    expect(popupClose.mock.invocationCallOrder[0]).toBeLessThan(
+      browserClose.mock.invocationCallOrder[0],
     );
   });
 });

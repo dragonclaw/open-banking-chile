@@ -40,10 +40,14 @@ export async function runScraper(
   }
 
   let session: BrowserSession | undefined;
+  let cleanupPromise: Promise<void> | undefined;
+  const startCleanup = (shouldLogout: boolean): Promise<void> => {
+    if (!session) return Promise.resolve();
+    cleanupPromise ??= closeBrowserSession(session, shouldLogout);
+    return cleanupPromise;
+  };
   const closeBrowserOnAbort = (): void => {
-    if (session?.browser) {
-      void session.browser.close().catch(() => {});
-    }
+    void startCleanup(false);
   };
 
   try {
@@ -77,15 +81,22 @@ export async function runScraper(
     };
   } finally {
     signal?.removeEventListener("abort", closeBrowserOnAbort);
-
-    if (session?.browser) {
-      try {
-        const pages = await session.browser.pages();
-        if (pages.length > 0) await logout(pages[pages.length - 1], session.debugLog);
-      } catch { /* best effort */ }
-      await session.browser.close().catch(() => {});
-    }
+    await startCleanup(!signal?.aborted);
   }
+}
+
+async function closeBrowserSession(
+  session: BrowserSession,
+  shouldLogout: boolean,
+): Promise<void> {
+  if (shouldLogout) await logout(session.page, session.debugLog);
+
+  const browserPages = await session.browser.pages().catch(() => []);
+  const pages = browserPages.includes(session.page)
+    ? browserPages
+    : [session.page, ...browserPages];
+  await Promise.all(pages.map((page) => page.close().catch(() => {})));
+  await session.browser.close().catch(() => {});
 }
 
 function buildCancelledScrapeResult(

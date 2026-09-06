@@ -8,6 +8,7 @@ import falabella, {
   isElementBoxInViewport,
   navigateToFalabellaHomepage,
   normalizeFalabellaRut,
+  redactSensitiveInputValues,
 } from "./falabella.js";
 
 function createFalabellaPointsModalPage(visibleChecksBeforeGone: number) {
@@ -226,6 +227,7 @@ describe("Banco Falabella login helpers", () => {
       classifyFalabellaLoginSnapshot({
         bodyText: "Debes ingresar tu clave dinámica",
         hasAuthenticatedRoot: true,
+        hasLoginForm: false,
         pathname: "/web-clientes/",
         visibleErrors: [],
       }),
@@ -237,6 +239,7 @@ describe("Banco Falabella login helpers", () => {
       classifyFalabellaLoginSnapshot({
         bodyText: "RUT Clave internet",
         hasAuthenticatedRoot: false,
+        hasLoginForm: true,
         pathname: "/",
         visibleErrors: ["RUT o clave incorrectos"],
       }),
@@ -250,12 +253,14 @@ describe("Banco Falabella login helpers", () => {
     {
       bodyText: "",
       hasAuthenticatedRoot: false,
+      hasLoginForm: false,
       pathname: "/web-clientes/",
       visibleErrors: [],
     },
     {
       bodyText: "",
       hasAuthenticatedRoot: true,
+      hasLoginForm: false,
       pathname: "/",
       visibleErrors: [],
     },
@@ -270,9 +275,38 @@ describe("Banco Falabella login helpers", () => {
       classifyFalabellaLoginSnapshot({
         bodyText: "RUT Clave internet",
         hasAuthenticatedRoot: false,
+        hasLoginForm: true,
         pathname: "/",
         visibleErrors: [],
       }),
     ).toBeNull();
+  });
+
+  it("ignores the homepage anti-fraud warning while the login form is present", () => {
+    expect(
+      classifyFalabellaLoginSnapshot({
+        bodyText: "Nunca te pediremos tu clave dinámica",
+        hasAuthenticatedRoot: false,
+        hasLoginForm: true,
+        pathname: "/",
+        visibleErrors: [],
+      }),
+    ).toBeNull();
+  });
+
+  it("redacts credentials from saved login HTML", () => {
+    const html = [
+      '<input id="document" type="text" value="12345678-9">',
+      '<input value="secret" name="pass" type="password">',
+      '<input id="search" type="text" value="visible">',
+    ].join("");
+
+    expect(redactSensitiveInputValues(html)).toBe(
+      [
+        '<input id="document" type="text" value="[REDACTED]">',
+        '<input value="[REDACTED]" name="pass" type="password">',
+        '<input id="search" type="text" value="visible">',
+      ].join(""),
+    );
   });
 });

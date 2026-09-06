@@ -29,6 +29,9 @@ const RUT_INPUT_SELECTOR =
   '#document, input[name="document"], input[name*="rut" i], input[id*="rut" i], input[placeholder*="RUT" i]';
 const PASSWORD_INPUT_SELECTOR =
   '#pass, input[name="pass"], input[type="password"], input[name*="clave" i], input[id*="clave" i]';
+const SENSITIVE_INPUT_PATTERN =
+  /<input\b[^>]*(?:type="password"|(?:id|name)="(?:document|pass)")[^>]*>/gi;
+const INPUT_VALUE_PATTERN = /\svalue="[^"]*"/i;
 const LOGIN_FORM_UNAVAILABLE_ERROR =
   "El banco cambió o no pudo mostrar su formulario de acceso.";
 const LOGIN_FORM_REJECTED_ERROR =
@@ -63,6 +66,7 @@ interface LoginKeyboard {
 interface FalabellaLoginSnapshot {
   bodyText: string;
   hasAuthenticatedRoot: boolean;
+  hasLoginForm: boolean;
   pathname: string;
   visibleErrors: string[];
 }
@@ -126,11 +130,22 @@ async function launchPlaywright(options: ScraperOptions): Promise<{ browser: Bro
 async function screenshotIfEnabled(page: Page, name: string, enabled: boolean, debugLog: string[]): Promise<string | undefined> {
   if (!enabled) return undefined;
   const safeName = name.replace(/[/\\:*?"<>|]/g, "_");
-  const dir = path.resolve("screenshots");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  await page.screenshot({ path: path.join(dir, `${safeName}.png`), fullPage: true });
+  const screenshotDir = path.resolve("screenshots");
+  const debugDir = path.resolve("debug");
+  if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
+  if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
+  await page.screenshot({ path: path.join(screenshotDir, `${safeName}.png`), fullPage: true });
+  const redactedHtml = redactSensitiveInputValues(await page.content());
+  await fs.promises.writeFile(path.join(debugDir, `${safeName}.html`), redactedHtml);
   debugLog.push(`  Screenshot: ${safeName}.png`);
+  debugLog.push(`  HTML: debug/${safeName}.html`);
   return undefined;
+}
+
+export function redactSensitiveInputValues(html: string): string {
+  return html.replace(SENSITIVE_INPUT_PATTERN, (input) =>
+    input.replace(INPUT_VALUE_PATTERN, ' value="[REDACTED]"'),
+  );
 }
 
 // ─── Login ───────────────────────────────────────────────────────
@@ -191,9 +206,10 @@ export function classifyFalabellaLoginSnapshot(
 ): FalabellaLoginOutcome | null {
   const normalizedBody = snapshot.bodyText.toLowerCase();
   if (
-    normalizedBody.includes("clave dinámica") ||
-    normalizedBody.includes("clave dinamica") ||
-    normalizedBody.includes("segundo factor")
+    !snapshot.hasLoginForm &&
+    (normalizedBody.includes("clave dinámica") ||
+      normalizedBody.includes("clave dinamica") ||
+      normalizedBody.includes("segundo factor"))
   ) {
     return { status: "two_factor" };
   }
@@ -244,6 +260,7 @@ async function login(
   } catch {
     return captureFalabellaLoginFailure(page, LOGIN_FORM_UNAVAILABLE_ERROR);
   }
+  await screenshotIfEnabled(page, "02-filled-login-form", doScreenshots, debugLog);
 
   debugLog.push("4. Submitting login...");
   progress("Iniciando sesión...");
@@ -256,6 +273,7 @@ async function login(
         : LOGIN_FORM_UNAVAILABLE_ERROR;
     return captureFalabellaLoginFailure(page, failureMessage);
   }
+  await screenshotIfEnabled(page, "03-login-submitted", doScreenshots, debugLog);
 
   const outcome = await waitForFalabellaLoginOutcome(page);
   if (outcome.status !== "authenticated") {
@@ -390,7 +408,7 @@ async function waitForFalabellaLoginOutcome(page: Page): Promise<FalabellaLoginO
 
 async function readFalabellaLoginSnapshot(page: Page): Promise<FalabellaLoginSnapshot> {
   return page.evaluate(
-    ({ authenticatedRootSelector, errorSelector }) => {
+    ({ authenticatedRootSelector, errorSelector, loginFormSelector }) => {
       const isVisible = (element: Element): boolean => {
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
@@ -409,6 +427,7 @@ async function readFalabellaLoginSnapshot(page: Page): Promise<FalabellaLoginSna
       return {
         bodyText: document.body?.innerText ?? "",
         hasAuthenticatedRoot: Boolean(document.querySelector(authenticatedRootSelector)),
+        hasLoginForm: Boolean(document.querySelector(loginFormSelector)),
         pathname: window.location.pathname,
         visibleErrors,
       };
@@ -416,6 +435,7 @@ async function readFalabellaLoginSnapshot(page: Page): Promise<FalabellaLoginSna
     {
       authenticatedRootSelector: AUTHENTICATED_ROOT_SELECTOR,
       errorSelector: LOGIN_ERROR_SELECTOR,
+      loginFormSelector: RUT_INPUT_SELECTOR,
     },
   );
 }
