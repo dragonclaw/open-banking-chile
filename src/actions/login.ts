@@ -69,7 +69,7 @@ export async function fillRut(
     try {
       const el = await context.$(sel);
       if (el) {
-        await el.click({ clickCount: 3 });
+        await el.click({ count: 3 });
         // For short-maxlength fields, use clean RUT; otherwise formatted
         await el.type(sel === "#rut" ? clean : formatted, { delay: 45 });
         return true;

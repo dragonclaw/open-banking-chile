@@ -9,21 +9,22 @@ import {
   type ScraperOptions,
 } from "../types.js";
 import {
-  closePopups,
   delay,
   deduplicateMovements,
   normalizeDate,
   parseChileanAmount,
 } from "../utils.js";
 import { runScraper } from "../infrastructure/scraper-runner.js";
+import type { BrowserOptions } from "../infrastructure/browser.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import {
-  fillRut,
-  fillPassword,
-  clickSubmit,
-  detectLoginError,
-} from "../actions/login.js";
-import { dismissBanners } from "../actions/navigation.js";
+  configureScotiabankPage,
+  loginScotiabank,
+  resolveScotiabankChrome,
+  resolveScotiabankProfileDirectory,
+  SCOTIABANK_BROWSER_HEADERS,
+  SCOTIABANK_CHROME_ARGS,
+} from "./scotiabank-auth.js";
 import {
   isScotiabankFullAccountPage,
   parseScotiabankAccountMovements,
@@ -34,22 +35,6 @@ import {
 // ─── Scotiabank-specific constants ───────────────────────────────
 
 const BANK_URL = "https://www.scotiabank.cl";
-
-const LOGIN_SELECTORS = {
-  rutSelectors: [
-    "#inputDni",
-    'input[name="inputDni"]',
-    'input[id*="Dni"]',
-    'input[name*="Dni"]',
-  ],
-  passwordSelectors: [
-    "#inputPassword",
-    'input[name="inputPassword"]',
-    'input[id*="Password"]',
-    'input[name*="Password"]',
-  ],
-  rutFormat: "dash" as const,
-};
 
 const CREDIT_CARD_STATEMENT_PATH =
   "/mfe/sweb/mfe-shell-web-cl/mfe/mfe-simple-account-statement-web-cl/";
@@ -68,19 +53,22 @@ function allDeepJs(): string {
 
 // ─── Scotiabank-specific helpers ─────────────────────────────────
 
-async function waitForDashboardContent(page: Page): Promise<void> {
+async function waitForDashboardContent(page: Page): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < 15000) {
-    const hasContent = await page.evaluate(
-      new Function(`${allDeepJs()}
+    const hasContent = await page
+      .evaluate(
+        new Function(`${allDeepJs()}
       return allDeep(document, "a, button, span").some(el => {
         const text = (el.innerText || el.textContent || "").trim().toLowerCase();
         return text === "ver saldos y últimos movimientos" || text === "ver saldos y ultimos movimientos" || text === "cuenta corriente";
       });`) as () => boolean,
-    );
-    if (hasContent) break;
+      )
+      .catch(() => false);
+    if (hasContent) return true;
     await delay(1500);
   }
+  return false;
 }
 
 async function dismissScotiaTutorial(
@@ -1008,7 +996,7 @@ async function gotoCreditCardStatementTab(
 ): Promise<boolean> {
   try {
     await page.goto(buildCreditCardStatementUrl(page, tab), {
-      waitUntil: "networkidle2",
+      waitUntil: "domcontentloaded",
       timeout: 20000,
     });
     debugLog.push(`  TC direct URL: ${tab}`);
@@ -1512,116 +1500,33 @@ async function scrapeScotiabank(
   options: ScraperOptions,
 ): Promise<ScrapeResult> {
   const { rut, password, saveScreenshots: doScreenshots, onProgress } = options;
-  const { page, debugLog, screenshot: doSave } = session;
+  const { browser, page, debugLog, screenshot: doSave } = session;
   const progress = onProgress || (() => {});
   const bank = "scotiabank";
 
-  // 1. Navigate
-  debugLog.push("1. Navigating to Scotiabank...");
-  progress("Abriendo sitio del banco...");
-  await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 });
-  await delay(2000);
-  await dismissBanners(page);
-  await doSave(page, "01-homepage");
-
-  // 2. Login
-  debugLog.push("2. Clicking login button...");
-  await page.evaluate(() => {
-    for (const el of Array.from(document.querySelectorAll("a, button"))) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase() || "";
-      const href = (el as HTMLAnchorElement).href || "";
-      if (
-        text === "ingresar" ||
-        text === "acceso clientes" ||
-        text.includes("iniciar sesión") ||
-        href.includes("login") ||
-        href.includes("auth")
-      ) {
-        (el as HTMLElement).click();
-        return;
-      }
-    }
-  });
-  await delay(4000);
-  await doSave(page, "02-login-form");
-
-  debugLog.push("3. Filling RUT...");
-  progress("Ingresando RUT...");
-  if (!(await fillRut(page, rut, LOGIN_SELECTORS))) {
-    const ss = await page.screenshot({ encoding: "base64" });
+  await configureScotiabankPage(browser, page, debugLog, Boolean(options.onDebug));
+  const loginResult = await loginScotiabank(
+    page,
+    rut,
+    password,
+    debugLog,
+    doSave,
+    progress,
+    {
+      dismissTutorial: dismissScotiaTutorial,
+      waitForDashboard: waitForDashboardContent,
+    },
+  );
+  if (!loginResult.success) {
     return {
-      success: false,
-      bank,
       accounts: [],
-      error: "No se encontró campo de RUT",
-      screenshot: ss as string,
+      bank,
       debug: debugLog.join("\n"),
+      error: loginResult.error,
+      screenshot: loginResult.screenshot,
+      success: false,
     };
   }
-  await delay(1000);
-
-  debugLog.push("4. Filling password...");
-  let passOk = await fillPassword(page, password, LOGIN_SELECTORS);
-  if (!passOk) {
-    await page.keyboard.press("Enter");
-    await delay(3000);
-    passOk = await fillPassword(page, password, LOGIN_SELECTORS);
-  }
-  if (!passOk) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return {
-      success: false,
-      bank,
-      accounts: [],
-      error: "No se encontró campo de clave",
-      screenshot: ss as string,
-      debug: debugLog.join("\n"),
-    };
-  }
-  await delay(800);
-
-  debugLog.push("5. Submitting login...");
-  progress("Iniciando sesión...");
-  await clickSubmit(page, page, LOGIN_SELECTORS);
-  await delay(8000);
-  await doSave(page, "03-after-login");
-
-  // 2FA check
-  const pageContent = (await page.content()).toLowerCase();
-  if (
-    pageContent.includes("clave dinámica") ||
-    pageContent.includes("segundo factor") ||
-    pageContent.includes("código de verificación") ||
-    pageContent.includes("token")
-  ) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return {
-      success: false,
-      bank,
-      accounts: [],
-      error: "El banco pide clave dinámica o 2FA.",
-      screenshot: ss as string,
-      debug: debugLog.join("\n"),
-    };
-  }
-
-  const loginError = await detectLoginError(page);
-  if (loginError) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return {
-      success: false,
-      bank,
-      accounts: [],
-      error: `Error del banco: ${loginError}`,
-      screenshot: ss as string,
-      debug: debugLog.join("\n"),
-    };
-  }
-
-  debugLog.push("6. Login OK!");
-  progress("Sesión iniciada correctamente");
-  await closePopups(page);
-  await dismissScotiaTutorial(page, debugLog);
 
   // 7. Navigate to cartola
   debugLog.push("7. Looking for Cartola/Movimientos...");
@@ -1741,7 +1646,7 @@ async function scrapeScotiabank(
         : currentUrl + (currentUrl.includes("?") ? "&" : "?") + "tab=cartolas";
       try {
         await page.goto(cartolasUrl, {
-          waitUntil: "networkidle2",
+          waitUntil: "domcontentloaded",
           timeout: 15000,
         });
         clickedVerCartolas = true;
@@ -2067,11 +1972,33 @@ async function scrapeScotiabank(
 
 // ─── Export ──────────────────────────────────────────────────────
 
+function buildScotiabankBrowserOptions(): Partial<BrowserOptions> {
+  return {
+    customArgs: SCOTIABANK_CHROME_ARGS,
+    extraHeaders: SCOTIABANK_BROWSER_HEADERS,
+    ignoreDefaultArgs: ["--enable-automation"],
+    preserveUserAgent: true,
+    userDataDir: resolveScotiabankProfileDirectory(
+      process.env.SCOTIABANK_USER_DATA_DIR?.trim(),
+    ),
+    viewport: { height: 1080, width: 1920 },
+  };
+}
+
 const scotiabank: BankScraper = {
   id: "scotiabank",
   name: "Scotiabank Chile",
   url: BANK_URL,
-  scrape: (options) => runScraper("scotiabank", options, {}, scrapeScotiabank),
+  scrape: async (options) =>
+    runScraper(
+      "scotiabank",
+      {
+        ...options,
+        chromePath: (await resolveScotiabankChrome(options.chromePath)) ?? options.chromePath,
+      },
+      buildScotiabankBrowserOptions(),
+      scrapeScotiabank,
+    ),
 };
 
 export default scotiabank;

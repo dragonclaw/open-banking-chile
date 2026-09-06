@@ -81,7 +81,7 @@ async function bchileLogin(
       const el = await page.$(sel);
       if (el) {
         const maxLen = await page.evaluate((s: string) => (document.querySelector(s) as HTMLInputElement | null)?.maxLength ?? -1, sel);
-        await el.click({ clickCount: 3 });
+        await el.click({ count: 3 });
         await el.type((maxLen > 0 && maxLen <= 10) ? cleanRut : formattedRut, { delay: 45 });
         rutFilled = true;
         break;

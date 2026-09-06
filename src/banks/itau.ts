@@ -36,7 +36,7 @@ async function itauLogin(
     const ss = await page.screenshot({ encoding: "base64" });
     return { success: false, error: "No se encontró campo de RUT (#loginNameID)", screenshot: ss as string };
   }
-  await rutEl.click({ clickCount: 3 });
+  await rutEl.click({ count: 3 });
   await rutEl.type(formatRut(rut), { delay: 45 });
 
   debugLog.push("3. Filling password...");
