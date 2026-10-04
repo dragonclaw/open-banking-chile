@@ -5,65 +5,19 @@ import { closePopups, delay, parseChileanAmount, normalizeDate, deduplicateMovem
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { clickByText } from "../actions/navigation.js";
+import {
+  buildBestadoBrowserOptions,
+  fillBestadoInput,
+  observeBestadoLoginResponses,
+  waitForBestadoLogin,
+  type BestadoLoginObservation,
+} from "./bestado-auth.js";
 
 // ─── Bestado-specific constants ──────────────────────────────────
 
 const LOGIN_URL = "https://www.bancoestado.cl/content/bancoestado-public/cl/es/home/home.html#/login";
 
 // ─── Bestado-specific helpers ────────────────────────────────────
-
-async function fillRut(page: Page, rut: string): Promise<boolean> {
-  const rutInput = await page.$("#rut");
-  if (!rutInput) return false;
-
-  await rutInput.click();
-  await delay(500);
-
-  // Angular removes readonly on focus — force-remove if still present
-  const isReadonly = await page.evaluate(() => {
-    const input = document.querySelector("#rut") as HTMLInputElement;
-    if (input?.hasAttribute("readonly")) {
-      input.removeAttribute("readonly");
-      input.focus();
-      return true;
-    }
-    return false;
-  });
-  if (isReadonly) await delay(300);
-
-  await rutInput.click({ count: 3 });
-  const cleanRut = rut.replace(/[.\-]/g, "");
-  await rutInput.type(cleanRut, { delay: 80 });
-
-  // Trigger Angular change detection
-  await page.evaluate(() => {
-    const input = document.querySelector("#rut") as HTMLInputElement;
-    if (input) {
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-  });
-
-  return true;
-}
-
-async function fillPassword(page: Page, password: string): Promise<boolean> {
-  const passInput = await page.$("#pass");
-  if (!passInput) return false;
-
-  await passInput.click({ count: 3 });
-  await passInput.type(password, { delay: 80 });
-
-  await page.evaluate(() => {
-    const input = document.querySelector("#pass") as HTMLInputElement;
-    if (input) {
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-  });
-
-  return true;
-}
 
 async function extractBalanceFromDashboard(page: Page, debugLog: string[]): Promise<number | undefined> {
   const balance = await page.evaluate(() => {
@@ -224,51 +178,35 @@ async function scrapeBestado(
   // 3-4. Fill credentials
   debugLog.push("3. Filling RUT...");
   progress("Ingresando RUT...");
-  if (!(await fillRut(page, rut))) {
+  if (!(await fillBestadoInput(page, "#rut", rut.replace(/[.\-\s]/g, "")))) {
     const ss = await page.screenshot({ encoding: "base64" });
     return { success: false, bank, accounts: [], error: "No se pudo llenar el RUT", screenshot: ss as string, debug: debugLog.join("\n") };
   }
 
   debugLog.push("4. Filling password...");
   progress("Ingresando clave...");
-  if (!(await fillPassword(page, password))) {
+  if (!(await fillBestadoInput(page, "#pass", password))) {
     const ss = await page.screenshot({ encoding: "base64" });
     return { success: false, bank, accounts: [], error: "No se pudo llenar la clave", screenshot: ss as string, debug: debugLog.join("\n") };
   }
-  await doSave(page, "03-credentials");
+  debugLog.push("  Credential fields match the supplied values and pass form validation.");
 
   // 5. Submit
   debugLog.push("5. Submitting login...");
   progress("Iniciando sesión...");
-  const submitBtn = await page.$("#btnLogin");
-  if (submitBtn) {
-    await submitBtn.click();
-  } else {
-    await page.evaluate(() => {
-      const form = document.querySelector("form");
-      if (form) form.dispatchEvent(new Event("submit", { bubbles: true }));
-    });
-  }
-
-  try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }); } catch { await delay(5000); }
-  await delay(3000);
-  await closePopups(page);
+  const observation = observeBestadoLoginResponses(page, debugLog);
+  const loginError = await submitBestadoLogin(page, debugLog, observation);
   await doSave(page, "04-post-login");
-
-  // Check login errors
-  const loginError = await page.evaluate(() => {
-    const errorKeywords = ["contraseña", "clave incorrecta", "rut inválido", "credenciales", "bloqueado", "intente nuevamente", "reintente"];
-    const errorEls = document.querySelectorAll('[class*="error"], [class*="alert"], .input-messages');
-    for (const el of errorEls) {
-      const text = (el as HTMLElement).innerText?.trim().toLowerCase();
-      if (text && errorKeywords.some(kw => text.includes(kw))) return (el as HTMLElement).innerText?.trim();
-    }
-    return null;
-  });
   if (loginError) {
-    const ss = await page.screenshot({ encoding: "base64" });
-    return { success: false, bank, accounts: [], error: `Login fallido: ${loginError}`, screenshot: ss as string, debug: debugLog.join("\n") };
+    return {
+      success: false,
+      bank,
+      accounts: [],
+      error: loginError,
+      debug: debugLog.join("\n"),
+    };
   }
+  await closePopups(page);
 
   // Dismiss promo modals
   await page.evaluate(() => {
@@ -360,11 +298,26 @@ async function scrapeBestado(
 
 // ─── Export ──────────────────────────────────────────────────────
 
+async function submitBestadoLogin(
+  page: Page,
+  debugLog: string[],
+  observation: BestadoLoginObservation,
+): Promise<string | null> {
+  try {
+    const submit = await page.$("#btnLogin");
+    if (!submit) return "BancoEstado no mostró el botón de acceso.";
+    await submit.click();
+    return await waitForBestadoLogin(page, debugLog, observation);
+  } finally {
+    observation.stop();
+  }
+}
+
 const bestado: BankScraper = {
   id: "bestado",
   name: "Banco Estado",
   url: "https://www.bancoestado.cl",
-  scrape: (options) => runScraper("bestado", options, { forceHeadful: true }, scrapeBestado),
+  scrape: (options) => runScraper("bestado", options, buildBestadoBrowserOptions(), scrapeBestado),
 };
 
 export default bestado;
